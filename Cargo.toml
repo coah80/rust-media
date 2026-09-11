@@ -4,9 +4,16 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.92"
 publish = false
+description = "Experimental native Rust video playback with progressive MP4 streaming"
+license = "MIT"
+repository = "https://github.com/coah80/rust-media"
+readme = "README.md"
+keywords = ["video", "media", "mp4", "h264", "playback"]
+categories = ["multimedia::video", "multimedia::audio"]
+include = ["/src/**", "/ui/**", "/examples/**", "/tests/**", "/docs/**", "/build.rs", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE", "/THIRD_PARTY.md", "/CONTRIBUTING.md"]
 
 [features]
-default = ["native"]
+default = []
 native = ["dep:slint", "dep:slint-build", "dep:lucide-slint"]
 
 [[bin]]

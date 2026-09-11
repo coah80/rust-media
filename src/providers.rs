@@ -15,7 +15,6 @@ impl std::fmt::Debug for Prepared {
     }
 }
 
-#[derive(Debug)]
 pub struct Resolved {
     pub video: String,
     pub audio: Option<String>,
@@ -24,6 +23,19 @@ pub struct Resolved {
     pub prepared: Option<Prepared>,
     pub progressive: bool,
     pub fragmented: bool,
+}
+
+impl std::fmt::Debug for Resolved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Resolved")
+            .field("provider", &self.provider)
+            .field("has_video", &!self.video.is_empty())
+            .field("has_audio", &self.audio.is_some())
+            .field("prepared", &self.prepared)
+            .field("progressive", &self.progressive)
+            .field("fragmented", &self.fragmented)
+            .finish_non_exhaustive()
+    }
 }
 
 pub fn resolve(input: &str) -> Result<Resolved, String> {
@@ -413,6 +425,22 @@ fn youtube_stream_error(data: &Value) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn debug_output_omits_signed_urls_and_titles() {
+        let resolved = super::Resolved {
+            video: "https://media.example/video?signature=private-video".into(),
+            audio: Some("https://media.example/audio?signature=private-audio".into()),
+            title: "private-title".into(),
+            provider: "YouTube".into(),
+            prepared: None,
+            progressive: true,
+            fragmented: true,
+        };
+        let output = format!("{resolved:?}");
+        assert!(output.contains("YouTube"));
+        assert!(!output.contains("private-"));
+        assert!(!output.contains("https://"));
+    }
     fn stalled_request_cancels(body_started: bool) {
         use std::{
             io::{Read, Write},

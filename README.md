@@ -1,6 +1,6 @@
 # Rust Media
 
-An experimental Rust video library and native Slint player. It resolves supported video links to media streams, reads MP4 data in byte ranges, decodes H.264 in Rust, plays AAC through Rodio/Symphonia, and gives the UI RGBA frames.
+An experimental Rust video library with an optional native Slint player. The API is pre-1.0 and may change; this is not a production reliability guarantee. It resolves supported video links to media streams, reads MP4 data in byte ranges, decodes H.264 in Rust, plays AAC through Rodio/Symphonia, and gives the UI RGBA frames.
 
 There is no WebView, browser engine, mpv, FFmpeg runtime, or Python helper. YouTube URL transformation uses Boa, a JavaScript interpreter written in Rust, with a Rust SWC preprocessor. No Node, Deno, V8 or QuickJS runtime is used. Windowing, graphics, audio output, TLS and other platform services still use their normal native dependencies. This is not a claim that every dependency or operating-system component is written in Rust.
 
@@ -23,28 +23,28 @@ The demo has volume, mute, fullscreen, keyboard controls, a seek bar, and contro
 Requires Rust 1.92 or newer. Windows uses the MSVC toolchain. Linux additionally needs native windowing and ALSA development packages, for example `libasound2-dev`, `libfontconfig1-dev`, `libxkbcommon-dev`, `libwayland-dev`, `libx11-dev`, `libx11-xcb-dev`, `libxcb-shape0-dev`, `libxcb-xfixes0-dev`, `libegl1-mesa-dev` and `libgl1-mesa-dev` on Ubuntu. macOS needs Xcode command-line tools. Linux execution has not been verified.
 
 ```sh
-cargo run --locked -- path/to/video.mp4
-cargo run --locked -- https://fixupx.com/user/status/POST_ID
-cargo run --release --locked -- https://www.youtube.com/watch?v=jNQXAC9IVRw
-cargo run --locked -- --probe path/to/video.mp4
-cargo run --release --locked -- --probe-all https://www.youtube.com/watch?v=Gf-fCJ6TkRU
+cargo run --locked --features native -- path/to/video.mp4
+cargo run --locked --features native -- https://fixupx.com/user/status/POST_ID
+cargo run --release --locked --features native -- https://www.youtube.com/watch?v=jNQXAC9IVRw
+cargo run --locked --features native -- --probe path/to/video.mp4
+cargo run --release --locked --features native -- --probe-all https://www.youtube.com/watch?v=Gf-fCJ6TkRU
 ```
 
 Run without an argument to paste a file path or supported link. Space toggles playback, Left/Right seek five seconds, M mutes, F toggles fullscreen, and Escape exits fullscreen. `--probe` resolves the complete input and decodes up to 60 frames without opening a window or playing audio. `--probe-all` decodes every video frame and AAC sample. Probe error output omits source URLs and response bodies.
 
-Set `SLINT_BACKEND` to `winit-software` or `winit-femtovg` to select a renderer. Release builds use `cargo build --release --locked`.
+Set `SLINT_BACKEND` to `winit-software` or `winit-femtovg` to select a renderer. Release builds use `cargo build --release --locked --features native`.
 
 ## Library
 
-Disable default features when consuming the library without Slint. The `native` feature belongs to the demo; the playback library does not depend on its UI state.
+The default library build has no Slint dependency. Enable `native` only for the demo. Git installation is supported; registry publication remains disabled while the script preprocessor uses a pinned Git dependency. Pin a reviewed commit with `rev` for reproducible integration.
 
 ```toml
 [dependencies]
-rust-media = { git = "https://github.com/coah80/rust-media", default-features = false }
+rust-media = { git = "https://github.com/coah80/rust-media", branch = "research/youtube-resolver" }
 ```
 
 ```rust
-use rust_media::player::Player;
+use rust_media::Player;
 
 let player = Player::new();
 player.load("clip.mp4".into());
@@ -54,7 +54,7 @@ player.set_volume(0.5);
 let snapshot = player.snapshot();
 ```
 
-Keep the player alive and poll `snapshot()` from the application's event loop. Each snapshot takes the newest available RGBA frame and includes `buffered`, the contiguous cached fraction used by the grey seek-bar layer. Older undisplayed frames are replaced. `Player` owns one worker, replacing queued loads with the newest request. Dropping or stopping it cancels playback. Provider metadata and SABR requests observe cancellation during both header and body waits. Live YouTube-to-local replacement took 20-40 ms. Direct-media range reads use blocking requests with finite timeouts.
+Keep the player alive and poll `snapshot()` from the application's event loop. Each snapshot takes the newest available RGBA frame and includes `buffered`, the contiguous cached fraction used by the grey seek-bar layer. Older undisplayed frames are replaced. `Player` owns one worker, replacing queued loads with the newest request. Dropping or stopping it requests cancellation; dropping does not synchronously join ongoing network work. Provider metadata and SABR requests observe cancellation during both header and body waits. Live YouTube-to-local replacement took 20-40 ms. Direct-media range reads use blocking requests with finite timeouts.
 
 `providers::resolve` returns stream addresses or prepared in-memory media. Use `MediaReader::resolved` to open either representation. `resolve_with_cancel` accepts a shared cancellation flag. `decode::MediaVideo` accepts ordinary or fragmented MP4 and emits timestamped frames. `http::RemoteFile` implements `Read + Seek` with 512 KiB blocks; progressive readers share a bounded cache and prefetch in the background. The player coordinates these parts and uses the audio playback clock when audio exists.
 
@@ -74,15 +74,15 @@ The [Windows stress and memory benchmarks](docs/benchmark-2026-09-11.md) record 
 
 ```sh
 cargo test --locked
-cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --all-features
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo doc --locked --no-deps
 cargo check --locked --no-default-features --lib
 ```
 
-Windows checks exercised native video and AAC playback, pause across frames, seeking while paused, resume, mute, fullscreen, Escape, resizing, end-of-file and replay with both Slint renderers. A live FixupX clip passed the same interaction sequence with femtovg. The temporary UI driver was removed after verification. Audio progress was checked through the active output pipeline; listening quality was not assessed.
+The benchmark report covers 53,913 frames across four complete videos, repeated startup, 240 seek comparisons and both Windows renderers. Listening quality, perceptual lip sync, sustained bandwidth starvation and this revision on macOS/Linux remain unverified. CI checks builds and synthetic tests on all three platforms; that does not establish device playback quality.
 
-On the development machine, the decoder probe processed 60 generated 1280×720 H.264 frames in 0.786 seconds, including opening the file and lookahead. This is a single local probe, not a general performance benchmark. FixupX returned 60 decodable 482×360 frames with a 19.034-second duration. The supplied `Gf-fCJ6TkRU` test reached its first progressive 720p frame in 1.166 seconds with 14.7% buffered, then decoded all 4,159 H.264 frames and 15,290,368 AAC samples through 173.292 seconds in 43.483 seconds. Indexed fragments are parsed as playback reaches them, so startup no longer scans the complete video. Fragmented seeking matched linear pixels in the synthetic fixture, and temporary live checks sought the supplied video and AAC to 120 seconds and `aqz-KE-bpKQ` video to 600 seconds before being removed. The earlier `aqz-KE-bpKQ` verification failure now resolves through the direct client path. The short control clip still passes. The macOS arm64 progressive build loaded the supplied clip in the native player and reached its media title. Windows native controls previously passed with both renderers; updated macOS controls were not independently exercised.
-
-The small committed synthetic fixtures check frame ordering, MP4 time offsets, pixel stability after seek, indexed startup without access to later fragments, direct fragmented decoding and seeking, cache gaps, fragment remux offsets, complete audio across interleaved video packets and malformed input handling. Protocol tests cover length bounds, timestamp overflow and script cancellation/deadlines. Provider and player tests cover destination restrictions, stale playback cancellation and invalid control values. The fixtures were generated locally, contain no account data and need no FFmpeg installation to run tests.
+See [contributing](CONTRIBUTING.md) for validation and release requirements. `cargo run --release --locked --example play -- clip.mp4` runs the playback worker with audio while discarding video frames. Generate API docs with `cargo doc --no-deps`.
 
 ## References
 
@@ -91,3 +91,7 @@ The small committed synthetic fixtures check frame ordering, MP4 time offsets, p
 - [FxEmbed status API](https://github.com/FxEmbed/FxEmbed/wiki/Status-Fetch-API), the public FixupX metadata contract.
 
 The next steps are direct-client fallback maintenance, adaptive quality selection, additional Rust codecs, and hardware decoding through native platform APIs. Rendering general web pages would be a separate project.
+
+## License
+
+Original project code is [MIT](LICENSE). Dependencies retain their own terms, including optional Slint licensing; see [third-party components](THIRD_PARTY.md). The native demo uses [Slint](https://slint.dev).
