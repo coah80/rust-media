@@ -280,13 +280,7 @@ fn youtube_visionos(
     )?;
     let player: Value =
         serde_json::from_slice(&response).map_err(|_| "Invalid YouTube player response")?;
-    let duration = player["videoDetails"]["lengthSeconds"]
-        .as_str()
-        .and_then(|value| value.parse::<u64>().ok())
-        .ok_or("YouTube did not provide a duration")?;
-    if duration == 0 || duration > 1200 || player["videoDetails"]["isLiveContent"] == true {
-        return Err("YouTube clips must be recorded videos under 20 minutes".into());
-    }
+    validate_youtube_video(&player)?;
     if let Some(resolved) = youtube_progressive(&player) {
         return Ok(resolved);
     }
@@ -341,6 +335,7 @@ fn json_after(text: &str, marker: &str) -> Option<Value> {
 }
 
 fn parse_youtube(player: &Value) -> Result<Resolved, String> {
+    validate_youtube_video(player)?;
     if player["playabilityStatus"]["status"] != "OK" {
         return Err("YouTube requires sign-in or does not allow this playback".into());
     }
@@ -398,6 +393,18 @@ fn parse_youtube(player: &Value) -> Result<Resolved, String> {
     })
 }
 
+fn validate_youtube_video(player: &Value) -> Result<(), String> {
+    let duration = player["videoDetails"]["lengthSeconds"]
+        .as_str()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or("YouTube did not provide a duration")?;
+    if duration == 0 || duration > 1200 || player["videoDetails"]["isLiveContent"] == true {
+        Err("YouTube clips must be recorded videos under 20 minutes".into())
+    } else {
+        Ok(())
+    }
+}
+
 fn is_h264_candidate(format: &Value) -> bool {
     let mime = format["mimeType"].as_str().unwrap_or_default();
     mime.starts_with("video/mp4")
@@ -453,6 +460,7 @@ mod tests {
     fn macroscope_ciphered_h264_reports_signature_resolution() {
         let player = serde_json::json!({
             "playabilityStatus": {"status": "OK"},
+            "videoDetails": {"lengthSeconds": "60", "isLiveContent": false},
             "streamingData": {
                 "adaptiveFormats": [
                     {
@@ -475,6 +483,30 @@ mod tests {
         assert_eq!(
             parse_youtube(&player).unwrap_err(),
             "This YouTube stream needs URL signature resolution, which is not supported yet"
+        );
+    }
+
+    #[test]
+    fn macroscope_desktop_fallback_rejects_long_video() {
+        let mut player = serde_json::json!({
+            "playabilityStatus": {"status": "OK"},
+            "videoDetails": {"lengthSeconds": "1201", "isLiveContent": false},
+            "streamingData": {"formats": [{
+                "mimeType": "video/mp4; codecs=\"avc1.4d401f, mp4a.40.2\"",
+                "height": 720,
+                "fps": 30,
+                "url": "https://rr1.googlevideo.com/video"
+            }]}
+        });
+        assert_eq!(
+            parse_youtube(&player).unwrap_err(),
+            "YouTube clips must be recorded videos under 20 minutes"
+        );
+        player["videoDetails"]["lengthSeconds"] = "60".into();
+        player["videoDetails"]["isLiveContent"] = true.into();
+        assert_eq!(
+            parse_youtube(&player).unwrap_err(),
+            "YouTube clips must be recorded videos under 20 minutes"
         );
     }
     fn stalled_request_cancels(body_started: bool) {
@@ -570,12 +602,12 @@ mod tests {
         let value =
             serde_json::json!({"tweet":{"media":{"videos":[{"url":"https://127.0.0.1/secret"}]}}});
         assert!(parse_fixtweet(&value).is_err());
-        let player = serde_json::json!({"playabilityStatus":{"status":"OK"},"streamingData":{"formats":[{"url":"https://evil.test/video","mimeType":"video/mp4; codecs=avc1,mp4a"}]}});
+        let player = serde_json::json!({"playabilityStatus":{"status":"OK"},"videoDetails":{"lengthSeconds":"60","isLiveContent":false},"streamingData":{"formats":[{"url":"https://evil.test/video","mimeType":"video/mp4; codecs=avc1,mp4a"}]}});
         assert!(parse_youtube(&player).is_err());
     }
     #[test]
     fn youtube_selects_muxed_h264_or_separate_aac() {
-        let player = serde_json::json!({"playabilityStatus":{"status":"OK"},"streamingData":{"formats":[{"url":"https://rr1.googlevideo.com/video","mimeType":"video/mp4; codecs=avc1,mp4a","height":360}]}});
+        let player = serde_json::json!({"playabilityStatus":{"status":"OK"},"videoDetails":{"lengthSeconds":"60","isLiveContent":false},"streamingData":{"formats":[{"url":"https://rr1.googlevideo.com/video","mimeType":"video/mp4; codecs=avc1,mp4a","height":360}]}});
         assert!(parse_youtube(&player).unwrap().audio.is_none());
         assert!(youtube_progressive(&player).unwrap().progressive);
     }

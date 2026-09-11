@@ -154,16 +154,18 @@ impl RemoteFile {
         self.cache.clone().map(BufferProgress)
     }
 
-    fn load(&mut self, start: u64) -> io::Result<()> {
+    fn load(&mut self, position: u64) -> io::Result<()> {
         if self.cancel.load(Ordering::Relaxed) {
             return Err(io::ErrorKind::Interrupted.into());
         }
-        if let Some((actual_start, bytes)) = self.cache.as_ref().and_then(|cache| cache.get(start))
+        if let Some((actual_start, bytes)) =
+            self.cache.as_ref().and_then(|cache| cache.get(position))
         {
             self.start = actual_start;
             self.bytes = bytes;
             return Ok(());
         }
+        let start = position / BLOCK * BLOCK;
         let end = start.saturating_add(BLOCK - 1).min(if self.size == 0 {
             self.max_size - 1
         } else {
@@ -349,7 +351,7 @@ impl Read for RemoteFile {
             return Ok(0);
         }
         if self.position < self.start || self.position >= self.start + self.bytes.len() as u64 {
-            self.load(self.position / BLOCK * BLOCK)?;
+            self.load(self.position)?;
         }
         let offset = (self.position - self.start) as usize;
         let length = output.len().min(self.bytes.len() - offset);
@@ -433,6 +435,27 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn macroscope_short_cached_block_does_not_end_stream() {
+        let cache = Arc::new(Cache::default());
+        cache.store(0, Arc::from([0, 1]), 4);
+        cache.store(2, Arc::from([2, 3]), 4);
+        let mut file = RemoteFile {
+            client: reqwest::blocking::Client::new(),
+            url: String::new(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            position: 2,
+            size: 4,
+            start: 0,
+            bytes: Arc::from([0, 1]),
+            cache: Some(cache),
+            max_size: 4,
+        };
+        let mut output = [0; 2];
+        assert_eq!(file.read(&mut output).unwrap(), 2);
+        assert_eq!(output, [2, 3]);
     }
 
     #[test]

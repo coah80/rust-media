@@ -47,6 +47,12 @@ fn remux_inner(data: &[u8], cancel: &AtomicBool) -> Result<Vec<u8>, Box<dyn std:
     if track.timescale() == 0 {
         return Err("invalid timescale".into());
     }
+    let trex = reader
+        .moov
+        .mvex
+        .as_ref()
+        .map(|mvex| &mvex.trex)
+        .filter(|trex| trex.track_id == track.track_id());
     let mut config = if let Some(avc) = &track.trak.mdia.minf.stbl.stsd.avc1 {
         if avc.avcc.length_size_minus_one != 3
             || avc.avcc.sequence_parameter_sets.len() != 1
@@ -87,6 +93,7 @@ fn remux_inner(data: &[u8], cancel: &AtomicBool) -> Result<Vec<u8>, Box<dyn std:
     )?;
     writer.add_track(&config)?;
     let mut time = 0u64;
+    let mut origin = None;
     let mut sample_count = 0usize;
     for (moof, base) in reader.moofs.iter().zip(moofs) {
         if cancel.load(Ordering::Relaxed) {
@@ -100,10 +107,17 @@ fn remux_inner(data: &[u8], cancel: &AtomicBool) -> Result<Vec<u8>, Box<dyn std:
         if traf.tfhd.track_id != track.track_id() || run.sample_count > 100_000 {
             return Err("invalid samples".into());
         }
-        if traf
-            .tfdt
-            .as_ref()
-            .is_some_and(|tfdt| tfdt.base_media_decode_time != time)
+        let timeline_origin = *origin.get_or_insert_with(|| {
+            traf.tfdt
+                .as_ref()
+                .map(|tfdt| tfdt.base_media_decode_time)
+                .unwrap_or(0)
+        });
+        if let Some(tfdt) = &traf.tfdt
+            && tfdt.base_media_decode_time
+                != timeline_origin
+                    .checked_add(time)
+                    .ok_or("timestamp overflow")?
         {
             return Err("noncontiguous fragments".into());
         }
@@ -116,18 +130,20 @@ fn remux_inner(data: &[u8], cancel: &AtomicBool) -> Result<Vec<u8>, Box<dyn std:
             if sample_count > 1_000_000 {
                 return Err("too many samples".into());
             }
-            let duration = run
-                .sample_durations
-                .get(index)
-                .copied()
-                .or(traf.tfhd.default_sample_duration)
-                .ok_or("no duration")?;
-            let size = run
-                .sample_sizes
-                .get(index)
-                .copied()
-                .or(traf.tfhd.default_sample_size)
-                .ok_or("no size")? as usize;
+            let duration = fragment_value(
+                &run.sample_durations,
+                index,
+                traf.tfhd.default_sample_duration,
+                trex.map(|trex| trex.default_sample_duration),
+            )
+            .ok_or("no duration")?;
+            let size = fragment_value(
+                &run.sample_sizes,
+                index,
+                traf.tfhd.default_sample_size,
+                trex.map(|trex| trex.default_sample_size),
+            )
+            .ok_or("no size")? as usize;
             let end = position.checked_add(size).ok_or("overflow")?;
             if size > 8 * 1024 * 1024
                 || duration == 0
@@ -137,17 +153,18 @@ fn remux_inner(data: &[u8], cancel: &AtomicBool) -> Result<Vec<u8>, Box<dyn std:
             {
                 return Err("sample outside media".into());
             }
-            let flags = run
-                .sample_flags
-                .get(index)
-                .copied()
-                .or(if index == 0 {
+            let flags = fragment_value(
+                &run.sample_flags,
+                index,
+                if index == 0 {
                     run.first_sample_flags
                 } else {
                     None
-                })
-                .or(traf.tfhd.default_sample_flags)
-                .unwrap_or(0);
+                }
+                .or(traf.tfhd.default_sample_flags),
+                trex.map(|trex| trex.default_sample_flags),
+            )
+            .unwrap_or(0);
             let cts = run.sample_cts.get(index).copied().unwrap_or(0);
             if run.version == 0 && cts > i32::MAX as u32 {
                 return Err("invalid composition time".into());
@@ -175,6 +192,19 @@ fn remux_inner(data: &[u8], cancel: &AtomicBool) -> Result<Vec<u8>, Box<dyn std:
     Ok(writer.into_writer().into_inner())
 }
 
+fn fragment_value<T: Copy>(
+    values: &[T],
+    index: usize,
+    fragment_default: Option<T>,
+    track_default: Option<T>,
+) -> Option<T> {
+    values
+        .get(index)
+        .copied()
+        .or(fragment_default)
+        .or(track_default)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,5 +222,12 @@ mod tests {
                 .to_string(),
             "too many top-level boxes"
         );
+    }
+
+    #[test]
+    fn macroscope_remux_uses_track_fragment_defaults() {
+        assert_eq!(fragment_value::<u32>(&[], 0, None, Some(7)), Some(7));
+        assert_eq!(fragment_value(&[1], 0, Some(2), Some(3)), Some(1));
+        assert_eq!(fragment_value::<u32>(&[], 0, Some(2), Some(3)), Some(2));
     }
 }

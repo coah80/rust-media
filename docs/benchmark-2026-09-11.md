@@ -4,15 +4,17 @@ Release builds on Windows x64, AMD Ryzen 7 9800X3D. Measurements use Windows pro
 
 ## Production-readiness rerun
 
-The final review run added 18 focused regressions covering all 17 Macroscope findings. They cover parser limits, aggregate fragment limits, multiple-run rejection, nonzero indexed timelines, edit lists, sparse-frame probing, split UMP parts, bounded context policies, reserved framing bytes, cancellation during stalled bodies and retries, provider error selection and Tokio runtime reentry.
+The final review run added 22 focused regressions covering all 21 posted Macroscope findings. They cover parser and cache limits, aggregate fragment limits, track defaults, multiple-run rejection, nonzero fragment timelines, edit lists, sparse-frame probing, split UMP parts, bounded context policies, reserved framing bytes, cancellation during stalled bodies and retries, duration enforcement, provider error selection and Tokio runtime reentry.
 
-The full suite passed 51 checks with native features. A separate stress test passed 100 fresh decoder open/seek cycles, 20 repeated complete ordinary decodes and 25 repeated complete fragmented decodes with exact presentation timestamps and RGBA checksums. This run found and fixed a B-frame seek boundary that the smaller seek test missed.
+The full suite passed 55 checks with native features. A separate stress test passed 100 fresh decoder open/seek cycles, 20 repeated complete ordinary decodes and 25 repeated complete fragmented decodes with exact presentation timestamps and RGBA checksums. This run found and fixed a B-frame seek boundary that the smaller seek test missed.
 
 Twelve fresh-process YouTube startup probes covered the same four videos three times each. Every video retained its checksum. First-frame time ranged from 1.000 to 1.780 seconds. A current complete Sintel run decoded 21,313 frames and 78,329,856 AAC samples through 888.000 seconds in 192.293 seconds. Its checksum remained `4f336c142cea91b5`, resident memory stayed roughly 140-153 MiB during the run and peaked at 163.4 MiB. A current complete `Gf-fCJ6TkRU` run decoded 4,159 frames and 15,290,368 AAC samples through 173.250 seconds in 46.298 seconds with checksum `bec25ce2bd6e2572`; peak resident/private memory was 110.5/99.6 MiB.
 
 Two public FixupX videos completed through video and audio with 464 and 908 frames. Their repeated 60-frame probes kept the same checksums. A clean external consumer built the default library without Slint and ran the real zero-volume `Player` pipeline to completion for a 192-frame local file and the 464-frame FixupX video.
 
-The reviewed Windows release executable SHA-256 is `fd0f80abc291d9233ce566996a4aadcc81bfc90e99844e8c8640c8946b17bbd5`.
+A current forced SABR fallback completed `jNQXAC9IVRw` through 284 frames and 1,681,408 AAC samples at 18.933 seconds with checksum `da6ae811065c373b`. The test used the production continuation parser and a temporary fallback selector that was removed afterward. The normal progressive path remained the release default.
+
+The reviewed Windows release executable SHA-256 is `eacf34b63b79a0de053414e5996957d0b8990964481f8787865f5c1075e7d489`.
 
 ## Problems found and fixes
 

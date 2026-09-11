@@ -492,3 +492,20 @@ fn macroscope_multiple_fragment_runs_are_rejected() {
     };
     assert_eq!(error, "Multiple video fragment runs are not supported");
 }
+
+#[test]
+fn macroscope_remux_normalizes_nonzero_fragment_origin() {
+    let source = include_bytes!("fixtures/fragmented.mp4");
+    let mut shifted = source.to_vec();
+    shift_fragment_times(&mut shifted, 90_000);
+    let expected = remux(source, &Default::default()).unwrap();
+    let actual = remux(&shifted, &Default::default()).unwrap();
+    let mut expected = Video::new(Cursor::new(&expected), expected.len() as u64).unwrap();
+    let mut actual = Video::new(Cursor::new(&actual), actual.len() as u64).unwrap();
+    while let Some(frame) = expected.frame().unwrap() {
+        let result = actual.frame().unwrap().unwrap();
+        assert_eq!(result.0, frame.0);
+        assert_eq!(result.1.rgba, frame.1.rgba);
+    }
+    assert!(actual.frame().unwrap().is_none());
+}

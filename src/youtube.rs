@@ -24,6 +24,13 @@ struct Track {
     last: i32,
     final_segment: Option<i64>,
 }
+
+struct PendingSegment {
+    header: p::Header,
+    bytes: Vec<u8>,
+    continued: bool,
+}
+
 impl Track {
     fn new(format: &Value) -> Result<Self, String> {
         Ok(Self {
@@ -226,8 +233,7 @@ pub(crate) fn prepare(
     let mut cookie = None;
     let mut contexts = BTreeMap::<i32, Vec<u8>>::new();
     let mut send_contexts = HashSet::new();
-    let mut parts = PartBuffer::default();
-    let mut headers = HashMap::<u32, (p::Header, Vec<u8>)>::new();
+    let mut headers = HashMap::<u32, PendingSegment>::new();
     let mut total = 0usize;
     let mut redirects = 0;
     let mut stalled = 0;
@@ -281,58 +287,83 @@ pub(crate) fn prepare(
             .body(request.encode_to_vec());
         let body = client.read(request, 32 * 1024 * 1024, &cancel, deadline)?;
         let before = total;
-        let pending_before = parts.len();
-        parts.push(&body)?;
+        let mut parts = ResponseParts::new(&body);
+        let mut response_header = None;
         let mut backoff = 0;
-        while let Some((kind, data)) = parts.next().map_err(|_| "Invalid YouTube media response")? {
+        while let Some(part) = parts.next().map_err(|_| "Invalid YouTube media response")? {
             check(&cancel, deadline)?;
-            match kind {
+            if !part.complete && part.kind != 21 {
+                return Err("YouTube ended an incomplete response part".into());
+            }
+            match part.kind {
                 20 => {
-                    let header = decode::<p::Header>(&data)?;
+                    let header = decode::<p::Header>(part.data)?;
                     if header.compression.unwrap_or(0) != 0
                         || header.length.unwrap_or(0) > MAX_PART as i64
-                        || headers.len() >= 32
                     {
                         return Err("Unsupported YouTube media segment".into());
                     }
                     let id = header.id.ok_or("Missing segment ID")?;
-                    if headers.insert(id, (header, Vec::new())).is_some() {
-                        return Err("Duplicate YouTube segment ID".into());
+                    if let Some(pending) = headers.get_mut(&id) {
+                        if !pending.continued || !same_media_header(&pending.header, &header) {
+                            return Err("Duplicate YouTube segment ID".into());
+                        }
+                    } else {
+                        if headers.len() >= 32 {
+                            return Err("Unsupported YouTube media segment".into());
+                        }
+                        headers.insert(
+                            id,
+                            PendingSegment {
+                                header,
+                                bytes: Vec::new(),
+                                continued: false,
+                            },
+                        );
                     }
+                    response_header = Some(id);
                 }
                 21 => {
-                    let id = u32::from(*data.first().ok_or("Empty media segment")?);
-                    let (_, bytes) = headers.get_mut(&id).ok_or("Missing media segment header")?;
-                    if bytes.len() + data.len() - 1 > MAX_PART || total + data.len() - 1 > MAX_MEDIA
+                    let (id, data) = match part.data.split_first() {
+                        Some((id, data)) => (u32::from(*id), data),
+                        None if !part.complete => (
+                            response_header.ok_or("Missing media segment header")?,
+                            part.data,
+                        ),
+                        None => return Err("Empty media segment".into()),
+                    };
+                    let pending = headers.get_mut(&id).ok_or("Missing media segment header")?;
+                    if pending.bytes.len() + data.len() > MAX_PART || total + data.len() > MAX_MEDIA
                     {
                         return Err("YouTube clip exceeds the 128 MB loading limit".into());
                     }
-                    total += data.len() - 1;
-                    bytes.extend_from_slice(&data[1..]);
+                    total += data.len();
+                    pending.bytes.extend_from_slice(data);
+                    pending.continued |= !part.complete;
                 }
                 22 => {
-                    let id = u32::from(*data.first().ok_or("Empty media segment end")?);
-                    let (header, bytes) =
-                        headers.remove(&id).ok_or("Missing media segment header")?;
-                    if header
-                        .length
-                        .is_some_and(|length| length >= 0 && length as usize != bytes.len())
+                    let id = u32::from(*part.data.first().ok_or("Empty media segment end")?);
+                    let pending = headers.remove(&id).ok_or("Missing media segment header")?;
+                    if !pending.continued
+                        && pending.header.length.is_some_and(|length| {
+                            length >= 0 && length as usize != pending.bytes.len()
+                        })
                     {
                         return Err("Incomplete YouTube media segment".into());
                     }
                     let track = tracks
                         .iter_mut()
-                        .find(|t| t.id.itag == header.itag)
+                        .find(|t| t.id.itag == pending.header.itag)
                         .ok_or("Unexpected YouTube media format")?;
-                    track.record(&header, bytes)?;
+                    track.record(&pending.header, pending.bytes)?;
                 }
                 35 => {
-                    let policy = decode::<p::Policy>(&data)?;
+                    let policy = decode::<p::Policy>(part.data)?;
                     cookie = policy.cookie;
                     backoff = policy.backoff.unwrap_or(0).max(0);
                 }
                 42 => {
-                    let init = decode::<p::Init>(&data)?;
+                    let init = decode::<p::Init>(part.data)?;
                     let track = tracks
                         .iter_mut()
                         .find(|t| Some(&t.id) == init.format.as_ref())
@@ -352,7 +383,7 @@ pub(crate) fn prepare(
                         return Err("Too many YouTube stream redirects".into());
                     }
                     url = reqwest::Url::parse(
-                        &decode::<p::Redirect>(&data)?
+                        &decode::<p::Redirect>(part.data)?
                             .url
                             .ok_or("Missing YouTube redirect")?,
                     )
@@ -360,15 +391,15 @@ pub(crate) fn prepare(
                 }
                 44 => return Err("YouTube returned a streaming error".into()),
                 57 => {
-                    let update = decode::<p::ContextUpdate>(&data)?;
+                    let update = decode::<p::ContextUpdate>(part.data)?;
                     update_context(&mut contexts, &mut send_contexts, update)?;
                 }
                 59 => {
-                    let policy = decode::<p::ContextPolicy>(&data)?;
+                    let policy = decode::<p::ContextPolicy>(part.data)?;
                     apply_context_policy(&mut contexts, &mut send_contexts, policy);
                 }
                 58 => {
-                    let protection = decode::<p::Protection>(&data)?;
+                    let protection = decode::<p::Protection>(part.data)?;
                     if protection.status.is_some_and(|status| status >= 3) {
                         return Err("YouTube requires client verification for this video".into());
                     }
@@ -377,7 +408,7 @@ pub(crate) fn prepare(
             }
         }
         if tracks.iter().all(Track::complete) {
-            if !headers.is_empty() || !parts.is_empty() {
+            if !headers.is_empty() {
                 return Err("YouTube ended an incomplete segment".into());
             }
             let [video, audio] = tracks;
@@ -386,11 +417,7 @@ pub(crate) fn prepare(
                 audio: audio.finish(&cancel, false)?,
             });
         }
-        stalled = if total == before && parts.len() <= pending_before {
-            stalled + 1
-        } else {
-            0
-        };
+        stalled = if total == before { stalled + 1 } else { 0 };
         if stalled >= 3 {
             return Err("YouTube stopped providing media data".into());
         }
@@ -461,6 +488,15 @@ fn apply_context_policy(
         contexts.remove(&kind);
     }
 }
+
+fn same_media_header(left: &p::Header, right: &p::Header) -> bool {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    left.length = None;
+    right.length = None;
+    left == right
+}
+
 fn check(cancel: &AtomicBool, deadline: Instant) -> Result<(), String> {
     if cancel.load(Ordering::Relaxed) {
         Err("Video loading cancelled".into())
@@ -526,45 +562,48 @@ fn read_part(input: &mut impl std::io::Read) -> io::Result<Option<(u32, Vec<u8>)
     Ok(Some((kind, data)))
 }
 
-#[derive(Default)]
-struct PartBuffer(Vec<u8>);
+struct ResponsePart<'a> {
+    kind: u32,
+    data: &'a [u8],
+    complete: bool,
+}
 
-impl PartBuffer {
-    fn push(&mut self, bytes: &[u8]) -> Result<(), String> {
-        if self.0.len().saturating_add(bytes.len()) > 40 * 1024 * 1024 {
-            return Err("YouTube response buffering exceeds the limit".into());
-        }
-        self.0.extend_from_slice(bytes);
-        Ok(())
+struct ResponseParts<'a> {
+    bytes: &'a [u8],
+    cursor: usize,
+}
+
+impl<'a> ResponseParts<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, cursor: 0 }
     }
 
-    fn next(&mut self) -> io::Result<Option<(u32, Vec<u8>)>> {
-        let Some((kind, kind_width)) = parse_uint(&self.0)? else {
+    fn next(&mut self) -> io::Result<Option<ResponsePart<'a>>> {
+        if self.cursor == self.bytes.len() {
             return Ok(None);
-        };
-        let Some((size, size_width)) = parse_uint(&self.0[kind_width..])? else {
-            return Ok(None);
-        };
+        }
+        let (kind, kind_width) =
+            parse_uint(&self.bytes[self.cursor..])?.ok_or(io::ErrorKind::UnexpectedEof)?;
+        let size_start = self.cursor + kind_width;
+        let (size, size_width) =
+            parse_uint(&self.bytes[size_start..])?.ok_or(io::ErrorKind::UnexpectedEof)?;
         let size = size as usize;
         if size > MAX_PART {
             return Err(io::ErrorKind::InvalidData.into());
         }
-        let header = kind_width + size_width;
-        let end = header.checked_add(size).ok_or(io::ErrorKind::InvalidData)?;
-        if self.0.len() < end {
-            return Ok(None);
-        }
-        let data = self.0[header..end].to_vec();
-        self.0.drain(..end);
-        Ok(Some((kind, data)))
-    }
-
-    fn len(&self) -> usize {
-        self.0.len()
-    }
-
-    fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        let data_start = size_start
+            .checked_add(size_width)
+            .ok_or(io::ErrorKind::InvalidData)?;
+        let available = size.min(self.bytes.len().saturating_sub(data_start));
+        let end = data_start
+            .checked_add(available)
+            .ok_or(io::ErrorKind::InvalidData)?;
+        self.cursor = end;
+        Ok(Some(ResponsePart {
+            kind,
+            data: &self.bytes[data_start..end],
+            complete: available == size,
+        }))
     }
 }
 
@@ -704,13 +743,24 @@ mod tests {
 
     #[test]
     fn macroscope_ump_part_spans_responses() {
-        let mut parts = PartBuffer::default();
-        parts.push(&[21, 4, 0, 1]).unwrap();
-        assert!(parts.next().unwrap().is_none());
-        assert_eq!(parts.len(), 4);
-        parts.push(&[2, 3]).unwrap();
-        assert_eq!(parts.next().unwrap(), Some((21, vec![0, 1, 2, 3])));
-        assert!(parts.is_empty());
+        let mut first = ResponseParts::new(&[21, 5, 0, 1]);
+        let first_media = first.next().unwrap().unwrap();
+        assert_eq!(first_media.kind, 21);
+        assert!(!first_media.complete);
+        assert!(first.next().unwrap().is_none());
+
+        let mut second = ResponseParts::new(&[20, 0, 21, 3, 0, 2, 3]);
+        let header = second.next().unwrap().unwrap();
+        assert_eq!(header.kind, 20);
+        assert!(header.complete);
+        let second_media = second.next().unwrap().unwrap();
+        assert_eq!(second_media.kind, 21);
+        assert!(second_media.complete);
+
+        let mut media = first_media.data[1..].to_vec();
+        media.extend_from_slice(&second_media.data[1..]);
+        assert_eq!(media, [1, 2, 3]);
+        assert!(second.next().unwrap().is_none());
     }
     #[test]
     fn invalid_media_time_does_not_overflow_or_divide_by_zero() {
