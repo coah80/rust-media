@@ -1,0 +1,106 @@
+import { IconDisplay, IconSet, Icon } from "@lucide";
+
+component Control inherits Rectangle {
+    in property <Icon> icon;
+    in property <string> label;
+    callback activated();
+    width: 36px; height: 36px; border-radius: 5px;
+    background: hit.has-hover ? #ffffff20 : transparent;
+    border-width: focus.has-focus ? 2px : 0px; border-color: #7fb3ff;
+    IconDisplay { x: 8px; y: 8px; size: 20px; icon: root.icon; stroke: #f2f3f5; }
+    forward-focus: focus;
+    focus := FocusScope { key-pressed(event) => { if event.text == " " || event.text == Key.Return { if !event.repeat { root.activated(); } return accept; } return reject; } }
+    hit := TouchArea { mouse-cursor: pointer; clicked => { root.activated(); } }
+    accessible-role: button; accessible-label: root.label; accessible-action-default => { root.activated(); }
+}
+
+export component PlayerWindow inherits Window {
+    title: root.media-title == "" ? "Rust Media" : root.media-title + " · Rust Media";
+    preferred-width: 960px; preferred-height: 640px; min-width: 480px; min-height: 320px;
+    background: #202124;
+    in-out property <string> address;
+    in property <string> media-title;
+    in property <image> frame;
+    in property <int> status;
+    in property <string> error;
+    in property <float> position;
+    in property <float> duration;
+    in-out property <float> volume: 1;
+    in-out property <bool> muted;
+    in-out property <bool> expanded;
+    property <bool> controls-visible: root.status != 2 || root.idle < 25;
+    property <int> idle;
+    init => { focus.focus(); }
+    callback load(string);
+    callback toggle();
+    callback seek(float);
+    callback set-volume(float);
+    callback expand();
+    public pure function timestamp(seconds: float) -> string {
+        return floor(seconds / 60) + ":" + (mod(floor(seconds), 60) < 10 ? "0" : "") + mod(floor(seconds), 60);
+    }
+    Timer { running: root.status == 2; interval: 100ms; triggered => { root.idle = min(root.idle + 1, 30); } }
+    forward-focus: focus;
+    focus := FocusScope {
+        key-pressed(event) => {
+            root.idle = 0;
+            if event.text == " " { if !event.repeat { root.toggle(); } return accept; }
+            if event.text == Key.LeftArrow { root.seek(max(0, root.position - 5)); return accept; }
+            if event.text == Key.RightArrow { root.seek(min(root.duration, root.position + 5)); return accept; }
+            if event.text == "f" || (event.text == Key.Escape && root.expanded) { root.expand(); return accept; }
+            if event.text == "m" { root.muted = !root.muted; root.set-volume(root.muted ? 0 : root.volume); return accept; }
+            return reject;
+        }
+    }
+    Rectangle {
+        visible: !root.expanded;
+        x: 12px; y: 12px; width: parent.width - 24px; height: 38px; border-radius: 6px; background: #141518;
+        border-color: input.has-focus ? #7fb3ff : #3b3d43; border-width: 1px;
+        input := TextInput { x: 12px; y: 0px; width: parent.width - 54px; height: parent.height; text <=> root.address; color: #eceef3; font-size: 14px; single-line: true; vertical-alignment: center; accepted => { root.load(root.address); focus.focus(); } }
+        if root.address == "" : Text { x: 12px; width: parent.width - 54px; height: parent.height; text: "Video URL or file path"; color: #b0b4be; font-size: 14px; vertical-alignment: center; }
+        Control { x: parent.width - 38px; y: 1px; icon: IconSet.ArrowRight; label: "Open video"; activated => { root.load(root.address); focus.focus(); } }
+    }
+    viewport := Rectangle {
+        x: root.expanded ? 0px : 12px; y: root.expanded ? 0px : 62px;
+        width: root.width - (root.expanded ? 0px : 24px); height: root.height - self.y - (root.expanded ? 0px : 12px);
+        background: #000000; border-radius: root.expanded ? 0px : 8px; clip: true;
+        Image { width: parent.width; height: parent.height; source: root.frame; image-fit: contain; }
+        TouchArea { mouse-cursor: root.controls-visible ? pointer : none; moved => { root.idle = 0; } clicked => { root.toggle(); root.idle = 0; } }
+        if root.status == 0 : Rectangle {
+            x: (parent.width - 56px) / 2; y: (parent.height - 56px) / 2; width: 56px; height: 56px;
+            IconDisplay { x: 12px; y: 12px; size: 32px; icon: IconSet.Film; stroke: #9297a3; }
+        }
+        if root.status == 1 : Rectangle {
+            x: (parent.width - 56px) / 2; y: (parent.height - 56px) / 2; width: 56px; height: 56px;
+            IconDisplay { x: 12px; y: 12px; size: 32px; icon: IconSet.LoaderCircle; stroke: #f2f3f5; }
+        }
+        if root.status == 3 || root.status == 4 : Rectangle {
+            x: (parent.width - 56px) / 2; y: (parent.height - 56px) / 2; width: 56px; height: 56px; border-radius: 28px; background: #141518d0;
+            IconDisplay { x: 14px; y: 14px; size: 28px; icon: root.status == 4 ? IconSet.RotateCcw : IconSet.Play; stroke: #ffffff; }
+        }
+        if root.error != "" : Text { x: 32px; y: max(0px, (parent.height - 100px) / 2); width: parent.width - 64px; height: 100px; text: root.error; color: #f2f3f5; font-size: 15px; wrap: word-wrap; horizontal-alignment: center; vertical-alignment: center; }
+        Rectangle {
+            visible: root.controls-visible && root.status != 0;
+            y: parent.height - 64px; width: parent.width; height: 64px; background: #141518e8;
+            TouchArea { moved => { root.idle = 0; } }
+            progress := Rectangle { x: 16px; y: 10px; width: parent.width - 32px; height: 4px; border-radius: 2px; background: #646974;
+                Rectangle { x: 0px; y: 0px; width: parent.width * (root.duration > 0 ? clamp(root.position / root.duration, 0, 1) : 0); height: parent.height; border-radius: 2px; background: #f2f3f5; }
+            }
+            TouchArea { x: 16px; y: 0px; width: parent.width - 32px; height: 22px; enabled: root.duration > 0; mouse-cursor: pointer;
+                clicked => { root.seek(clamp(self.mouse-x / self.width, 0, 1) * root.duration); }
+                moved => { root.idle = 0; if self.pressed { root.seek(clamp(self.mouse-x / self.width, 0, 1) * root.duration); } }
+            }
+            Control { x: 8px; y: 24px; icon: root.status == 2 ? IconSet.Pause : root.status == 5 ? IconSet.RotateCcw : IconSet.Play; label: root.status == 2 ? "Pause" : root.status == 5 ? "Retry" : "Play"; activated => { root.toggle(); } }
+            Text { x: 52px; y: 24px; width: 140px; height: 36px; text: root.timestamp(root.position) + " / " + root.timestamp(root.duration); color: #f2f3f5; font-size: 13px; vertical-alignment: center; }
+            Control { x: parent.width - 180px; y: 24px; label: root.muted ? "Unmute" : "Mute"; icon: root.muted || root.volume == 0 ? IconSet.VolumeX : IconSet.Volume2; activated => { root.muted = !root.muted; root.set-volume(root.muted ? 0 : root.volume); } }
+            Rectangle { x: parent.width - 136px; y: 40px; width: 72px; height: 4px; background: #646974; border-radius: 2px;
+                Rectangle { x: 0px; y: 0px; height: parent.height; width: parent.width * (root.muted ? 0 : root.volume); background: #f2f3f5; border-radius: 2px; }
+            }
+            TouchArea { x: parent.width - 136px; y: 24px; width: 72px; height: 36px; mouse-cursor: pointer;
+                clicked => { root.volume = clamp(self.mouse-x / self.width, 0, 1); root.muted = false; root.set-volume(root.volume); }
+                moved => { root.idle = 0; if self.pressed { root.volume = clamp(self.mouse-x / self.width, 0, 1); root.muted = false; root.set-volume(root.volume); } }
+            }
+            Control { x: parent.width - 44px; y: 24px; icon: root.expanded ? IconSet.Minimize : IconSet.Maximize; label: root.expanded ? "Exit fullscreen" : "Fullscreen"; activated => { root.expand(); } }
+        }
+    }
+}

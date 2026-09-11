@@ -1,0 +1,39 @@
+[package]
+name = "rust-media"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+publish = false
+
+[features]
+default = ["native"]
+native = ["dep:slint", "dep:slint-build", "dep:lucide-slint"]
+
+[[bin]]
+name = "rust-media"
+path = "src/main.rs"
+required-features = ["native"]
+
+[dependencies]
+mp4 = "0.14"
+rusty_h264-decoder = { version = "=0.16.0", default-features = false, features = ["std", "global-alloc"] }
+rusty_h264-common = { version = "=0.16.0", default-features = false, features = ["std", "global-alloc"] }
+rodio = { version = "0.22.2", default-features = false, features = ["playback", "mp4"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde_json = "1"
+slint = { version = "=1.17.1", optional = true, default-features = false, features = ["std", "backend-winit", "renderer-software", "renderer-femtovg", "accessibility", "compat-1-2"] }
+
+[build-dependencies]
+slint-build = { version = "=1.17.1", optional = true }
+lucide-slint = { version = "1.43.0", optional = true }
+
+[profile.dev.package.rusty_h264-decoder]
+opt-level = 3
+[profile.dev.package.rusty_h264-common]
+opt-level = 3
+[profile.dev.package.rust-media]
+opt-level = 2
+
+[profile.release]
+lto = "thin"
+strip = true
