@@ -165,7 +165,13 @@ impl<R: Read + Seek> Video<R> {
             self.next += 1;
             let time = (sample.start_time as f64 + f64::from(sample.rendering_offset)) / self.scale
                 - self.offset;
-            let packet = annex_b(&sample.bytes, self.length)?;
+            let (packet, idr) = annex_b(&sample.bytes, self.length)?;
+            if idr {
+                self.decoder = Decoder::new();
+                self.decoder
+                    .decode(&self.header)
+                    .map_err(|_| "Invalid video configuration")?;
+            }
             if let Some(frame) = self
                 .decoder
                 .decode(&packet)
@@ -550,7 +556,13 @@ impl<R: Read + Seek> FragmentVideo<R> {
                 .map_err(|_| "Could not read video")?;
             self.next += 1;
             let time = (sample.start as f64 + f64::from(sample.rendering_offset)) / self.scale;
-            let packet = annex_b(&bytes, self.length)?;
+            let (packet, idr) = annex_b(&bytes, self.length)?;
+            if idr {
+                self.decoder = Decoder::new();
+                self.decoder
+                    .decode(&self.header)
+                    .map_err(|_| "Invalid video configuration")?;
+            }
             if let Some(frame) = self
                 .decoder
                 .decode(&packet)
@@ -869,9 +881,10 @@ fn top_level_boxes<R: Read + Seek>(
     Ok((moofs, mdats))
 }
 
-fn annex_b(bytes: &[u8], length: usize) -> Result<Vec<u8>, String> {
+fn annex_b(bytes: &[u8], length: usize) -> Result<(Vec<u8>, bool), String> {
     let mut output = Vec::with_capacity(bytes.len() + 32);
     let mut cursor = 0usize;
+    let mut idr = false;
     while cursor < bytes.len() {
         let size = bytes
             .get(cursor..cursor + length)
@@ -880,11 +893,13 @@ fn annex_b(bytes: &[u8], length: usize) -> Result<Vec<u8>, String> {
             .fold(0usize, |size, byte| (size << 8) | usize::from(*byte));
         cursor += length;
         let end = cursor.checked_add(size).ok_or("Invalid video packet")?;
+        let nal = bytes.get(cursor..end).ok_or("Truncated video packet")?;
+        idr |= nal.first().is_some_and(|byte| byte & 0x1f == 5);
         output.extend_from_slice(&[0, 0, 0, 1]);
-        output.extend_from_slice(bytes.get(cursor..end).ok_or("Truncated video packet")?);
+        output.extend_from_slice(nal);
         cursor = end;
     }
-    Ok(output)
+    Ok((output, idr))
 }
 
 fn pixels(frame: rusty_h264_common::types::YuvFrame) -> Result<Pixels, String> {

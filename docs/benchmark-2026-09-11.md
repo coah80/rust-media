@@ -1,0 +1,56 @@
+# Windows playback benchmarks, 2026-09-11
+
+Release builds on Windows x64, AMD Ryzen 7 9800X3D. Measurements use Windows process memory counters sampled every 100 ms. Working set is resident process memory; private bytes are committed private memory. Neither includes all GPU memory. Live network timings include resolution and initial media reads. Concurrent builds and probes affected some full-decode timings, so they are correctness and memory checks, not controlled throughput comparisons.
+
+## Problems found and fixes
+
+The decoder's optional `global-alloc` feature installed its allocator across the entire application. On the same local 90-frame 720p clip, removing that feature reduced peak working set from 129.5 to 84.8 MiB and private bytes from 1029.8 to 74.4 MiB. Decode times were 0.959 and 0.981 seconds, with identical checksum `aa7c17764dfb791d`. Rust's normal platform allocator is now used.
+
+That change alone did not fix sustained decoder retention. A full Sintel decode still climbed from 154.5 MiB resident at five seconds to 1224.8 MiB at 205 seconds, peaking at 1227.3 MiB resident and 1264.6 MiB private. A temporary allocation counter confirmed these were live decoder-owned allocations that were released when the decoder was reset.
+
+Both MP4 paths now recreate the decoder at actual H.264 IDR pictures and reload the AVC configuration. IDR detection reads the length-delimited NAL headers; it does not treat every container sync flag as an IDR. The presentation queue remains intact. This releases retained decoder storage at independent picture boundaries. Streams with extremely sparse IDR pictures can still retain more memory between resets; this is not a hard process-memory cap.
+
+Three complete passes through the cached 4,159-frame supplied video peaked at 82.8 MiB resident and 78.7 MiB private after the change, versus 225.7 and 221.4 MiB before it with the platform allocator. Live allocations at frames 1000/2000/3000/4000 were 59.4/60.9/62.4/56.1 MiB on every pass, compared with 93.9/127.4/165.3/191.3 before. Dropping the decoder released its allocations in both cases. The counter and benchmark executable were temporary diagnostics, not shipped dependencies.
+
+## Interaction and integrity checks
+
+The complete 14:48 Sintel probe after IDR recycling peaked at 162.2 MiB resident and 151.5 MiB private, down from 1227.3 / 1264.6 MiB with the allocator-only fix. Resident samples remained approximately 137-156 MiB through the run rather than increasing with elapsed playback. Every decoded frame matched the earlier aggregate checksum.
+
+- 240 deterministic forward/backward indexed seeks matched linear presentation timestamps and every RGBA byte.
+- Delayed reads limited to 97 bytes and an injected timeout recovered to all 48 expected fixture frames with matching pixels and timestamps. This exercises the reader boundary, not a complete simulated network outage.
+- A temporary player driver completed 20 load/pause/paused-seek/resume/end/replay/replace/stop cycles through the real muted audio output pipeline, then passed another 20-cycle run. The repeated run peaked at 16.2 MiB resident and 4.3 MiB private.
+- A temporary native UI driver exercised the supplied YouTube clip with both Slint renderers: frame snapshot, Space pause, position stability, paused seek to 120 seconds, resume, mute, fullscreen, Escape, resize, seek to end, replay and replacement with a local clip. Software passed in 8.937 seconds at 140.7 MiB resident / 115.0 MiB private peak. Femtovg passed in 9.173 seconds at 200.5 / 231.4 MiB. These are automated interaction checks, not listening or perceptual lip-sync assessments.
+- Temporary UI and lifecycle drivers were removed. The seek and interrupted-reader tests remain because they protect decoded-data integrity.
+- `cargo test --locked`: 33 tests passed. Strict all-target Clippy and the library-only no-default-features check passed.
+
+## Startup repetition
+
+After the allocator change, before IDR recycling, three fresh-process probes per video all passed:
+
+| Video | First-frame range | Peak working-set range |
+| --- | ---: | ---: |
+| `Gf-fCJ6TkRU` | 1.431-1.501 s | 96.7-98.1 MiB |
+| `aqz-KE-bpKQ` | 1.162-1.429 s | 57.7-61.1 MiB |
+| `eRsGyueVLvQ` | 1.148-1.244 s | 89.5-90.5 MiB |
+| `LXb3EKWsInQ` | 1.222-1.610 s | 59.8-61.6 MiB |
+
+All twelve were progressive, decoded 60 frames, and retained each video's checksum across runs. These numbers are not guarantees for other networks or provider responses.
+
+## Complete decode after both fixes
+
+All four probes decoded the entire video and AAC stream, reached the final timestamp, filled the progressive cache, and matched the pre-change aggregate RGBA checksum. In total, 53,913 video frames were checked. These full probes ran with other work on the machine; use their wall times as observations, not isolated speed comparisons.
+
+| Video | Frames | AAC samples | Last PTS | First frame | Decode wall | Peak resident / private | RGBA checksum |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `Gf-fCJ6TkRU` | 4,159 | 15,290,368 | 173.292 s | 1.470 s | 57.331 s | 109.9 / 99.5 MiB | `bec25ce2bd6e2572` |
+| `aqz-KE-bpKQ` | 19,037 | 55,973,888 | 634.567 s | 1.083 s | 113.533 s | 98.1 / 87.0 MiB | `51d0ef36a46e0ca9` |
+| `eRsGyueVLvQ` | 21,313 | 78,329,856 | 888.042 s | 1.268 s | 240.537 s | 162.2 / 151.5 MiB | `4f336c142cea91b5` |
+| `LXb3EKWsInQ` | 9,404 | 27,680,768 | 313.780 s | 1.279 s | 82.825 s | 86.8 / 75.4 MiB | `032462b4ba44a69e` |
+
+Run a complete probe with `cargo run --release --locked -- --probe-all https://www.youtube.com/watch?v=VIDEO_ID`. Use `--probe` for startup plus 60 frames. Probes do not present frames in real time or play sound.
+
+After removing the temporary UI driver, the final release executable was rebuilt and all four startup probes passed again in sequence. First-frame times were 1.594 / 1.396 / 1.305 / 1.346 seconds in the table's video order; their 60-frame checksums matched the earlier runs. The local 90-frame 720p probe also retained checksum `aa7c17764dfb791d`. Final executable SHA-256: `4afe46b6991eaaece9b6b1c60017f9d7aecdfed04d27e20dfc650d30d3e0316c`.
+
+## Remaining coverage limits
+
+No adaptive quality switching, hardware decoding, arbitrary codecs, DRM or live-stream support was added. Listening quality, perceptual lip sync, extended real-time playback under sustained bandwidth starvation, and this revision on macOS/Linux remain unverified. Direct-media retries still have finite blocking request timeouts. Supported YouTube inputs retain the 20-minute / 128 MiB compressed-media limits. See [support details](youtube.md).

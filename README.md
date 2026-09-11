@@ -70,6 +70,8 @@ Keep the player alive and poll `snapshot()` from the application's event loop. E
 
 ## Validation
 
+The [Windows stress and memory benchmarks](docs/benchmark-2026-09-11.md) record repeated startup, complete decodes, seek integrity and native control checks. They also document the allocator and long-playback decoder retention fixes found during testing.
+
 ```sh
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings

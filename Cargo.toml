@@ -16,8 +16,8 @@ required-features = ["native"]
 
 [dependencies]
 mp4 = "0.14"
-rusty_h264-decoder = { version = "=0.16.0", default-features = false, features = ["std", "global-alloc"] }
-rusty_h264-common = { version = "=0.16.0", default-features = false, features = ["std", "global-alloc"] }
+rusty_h264-decoder = { version = "=0.16.0", default-features = false, features = ["std"] }
+rusty_h264-common = { version = "=0.16.0", default-features = false, features = ["std"] }
 rodio = { version = "0.22.2", default-features = false, features = ["playback", "mp4"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "cookies", "json", "rustls-tls"] }
 serde_json = "1"

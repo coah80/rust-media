@@ -12,6 +12,28 @@ struct LimitedCursor {
     limit: u64,
 }
 
+struct FragmentedReads {
+    cursor: Cursor<Arc<[u8]>>,
+    interrupt: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Read for FragmentedReads {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if self.interrupt.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        let length = output.len().min(97);
+        std::thread::sleep(std::time::Duration::from_micros(100));
+        self.cursor.read(&mut output[..length])
+    }
+}
+
+impl Seek for FragmentedReads {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.cursor.seek(position)
+    }
+}
+
 impl LimitedCursor {
     fn new(bytes: Arc<[u8]>, limit: usize) -> Self {
         Self {
@@ -228,4 +250,65 @@ fn fragments_reject_truncation_and_cancelled_assembly() {
         assert!(remux(&bytes[..length], &Default::default()).is_err());
     }
     assert!(remux(bytes, &std::sync::atomic::AtomicBool::new(true)).is_err());
+}
+
+#[test]
+fn indexed_seeks_preserve_pixels_across_repeated_direction_changes() {
+    let (bytes, _) = indexed_fixture();
+    let open = || {
+        MediaVideo::fragmented(
+            Cursor::new(bytes.clone()),
+            Cursor::new(bytes.clone()),
+            bytes.len() as u64,
+        )
+        .unwrap()
+    };
+    let mut linear = open();
+    let mut frames = Vec::new();
+    while let Some(frame) = linear.frame().unwrap() {
+        frames.push(frame);
+    }
+    let mut seeking = open();
+    for step in 0..240 {
+        let target = ((step * 37) % 190) as f64 / 100.;
+        let expected = frames.iter().find(|frame| frame.0 >= target).unwrap();
+        seeking.seek(target).unwrap();
+        let actual = loop {
+            let frame = seeking.frame().unwrap().unwrap();
+            if frame.0 >= target {
+                break frame;
+            }
+        };
+        assert_eq!(actual.0, expected.0, "seek {step} at {target}");
+        assert_eq!(actual.1.rgba, expected.1.rgba, "seek {step} at {target}");
+    }
+}
+
+#[test]
+fn delayed_short_reads_and_interruption_preserve_frames() {
+    let (bytes, _) = indexed_fixture();
+    let interrupted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader = || FragmentedReads {
+        cursor: Cursor::new(bytes.clone()),
+        interrupt: interrupted.clone(),
+    };
+    let mut actual = MediaVideo::fragmented(reader(), reader(), bytes.len() as u64).unwrap();
+    let mut expected = MediaVideo::fragmented(
+        Cursor::new(bytes.clone()),
+        Cursor::new(bytes.clone()),
+        bytes.len() as u64,
+    )
+    .unwrap();
+    interrupted.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(actual.frame().is_err());
+    interrupted.store(false, std::sync::atomic::Ordering::Relaxed);
+    let mut count = 0;
+    while let Some(frame) = expected.frame().unwrap() {
+        let result = actual.frame().unwrap().unwrap();
+        assert_eq!(frame.0, result.0);
+        assert_eq!(frame.1.rgba, result.1.rgba);
+        count += 1;
+    }
+    assert_eq!(count, 48);
+    assert!(actual.frame().unwrap().is_none());
 }
