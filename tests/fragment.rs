@@ -274,6 +274,114 @@ fn extend_mdat_headers(bytes: &[u8]) -> Vec<u8> {
     output
 }
 
+fn multiplex_eager_fragments(bytes: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(bytes.len() * 2);
+    let mut offset = 0usize;
+    while offset < bytes.len() {
+        let size = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        let end = offset + size;
+        if &bytes[offset + 4..offset + 8] == b"moov" {
+            let trak_kind = bytes[offset..end]
+                .windows(4)
+                .position(|value| value == b"trak")
+                .map(|position| offset + position)
+                .unwrap();
+            let trak_start = trak_kind - 4;
+            let trak_size =
+                u32::from_be_bytes(bytes[trak_start..trak_start + 4].try_into().unwrap()) as usize;
+            let mut foreign = bytes[trak_start..trak_start + trak_size].to_vec();
+            let tkhd = foreign
+                .windows(4)
+                .position(|value| value == b"tkhd")
+                .unwrap();
+            let track_id = if foreign[tkhd + 4] == 0 {
+                tkhd + 16
+            } else {
+                tkhd + 24
+            };
+            foreign[track_id..track_id + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+            let hdlr = foreign
+                .windows(4)
+                .position(|value| value == b"hdlr")
+                .unwrap();
+            foreign[hdlr + 12..hdlr + 16].copy_from_slice(b"soun");
+            let mut moov = bytes[offset..end].to_vec();
+            moov[..4].copy_from_slice(&((size + trak_size) as u32).to_be_bytes());
+            moov.extend_from_slice(&foreign);
+            output.extend_from_slice(&moov);
+            offset = end;
+            continue;
+        }
+        if &bytes[offset + 4..offset + 8] != b"moof" {
+            output.extend_from_slice(&bytes[offset..end]);
+            offset = end;
+            continue;
+        }
+        let mdat_size = u32::from_be_bytes(bytes[end..end + 4].try_into().unwrap()) as usize;
+        assert_eq!(&bytes[end + 4..end + 8], b"mdat");
+        let mdat_end = end + mdat_size;
+        let traf_kind = bytes[offset..end]
+            .windows(4)
+            .position(|value| value == b"traf")
+            .map(|position| offset + position)
+            .unwrap();
+        let traf_start = traf_kind - 4;
+        let traf_size =
+            u32::from_be_bytes(bytes[traf_start..traf_start + 4].try_into().unwrap()) as usize;
+        let mut foreign = bytes[traf_start..traf_start + traf_size].to_vec();
+        let foreign_tfhd = foreign
+            .windows(4)
+            .position(|value| value == b"tfhd")
+            .unwrap();
+        foreign[foreign_tfhd + 8..foreign_tfhd + 12].copy_from_slice(&u32::MAX.to_be_bytes());
+        let foreign_trun = foreign
+            .windows(4)
+            .position(|value| value == b"trun")
+            .unwrap();
+        let foreign_flags = u32::from_be_bytes([
+            0,
+            foreign[foreign_trun + 5],
+            foreign[foreign_trun + 6],
+            foreign[foreign_trun + 7],
+        ]);
+        assert_ne!(foreign_flags & 1, 0);
+        let new_moof_size = size + traf_size;
+        foreign[foreign_trun + 12..foreign_trun + 16]
+            .copy_from_slice(&((new_moof_size + 8) as i32).to_be_bytes());
+        let mut moof = bytes[offset..end].to_vec();
+        moof[..4].copy_from_slice(&(new_moof_size as u32).to_be_bytes());
+        let local_traf = traf_start - offset;
+        let video_tfhd = local_traf
+            + moof[local_traf..local_traf + traf_size]
+                .windows(4)
+                .position(|value| value == b"tfhd")
+                .unwrap();
+        let video_flags = u32::from_be_bytes([
+            0,
+            moof[video_tfhd + 5],
+            moof[video_tfhd + 6],
+            moof[video_tfhd + 7],
+        ]);
+        assert_eq!(video_flags & 1, 0);
+        moof[video_tfhd + 5] &= !2;
+        let video_trun = local_traf
+            + moof[local_traf..local_traf + traf_size]
+                .windows(4)
+                .position(|value| value == b"trun")
+                .unwrap();
+        moof[video_trun + 12..video_trun + 16].copy_from_slice(&0i32.to_be_bytes());
+        moof.splice(local_traf..local_traf, foreign);
+        let payload = &bytes[end + 8..mdat_end];
+        output.extend_from_slice(&moof);
+        output.extend_from_slice(&((8 + payload.len() * 2) as u32).to_be_bytes());
+        output.extend_from_slice(b"mdat");
+        output.extend_from_slice(payload);
+        output.extend_from_slice(payload);
+        offset = mdat_end;
+    }
+    output
+}
+
 fn prepend_foreign_sidx(bytes: &[u8]) -> Vec<u8> {
     let kind = bytes.windows(4).position(|value| value == b"sidx").unwrap();
     let start = kind - 4;
@@ -318,6 +426,33 @@ fn fragmented_video_decodes_without_full_remux() {
         count += 1;
     }
     assert_eq!(count, 48);
+}
+
+#[test]
+fn macroscope_eager_fragments_follow_preceding_traf() {
+    let source = include_bytes!("fixtures/fragmented.mp4");
+    let multiplexed = multiplex_eager_fragments(source);
+    let mut expected = MediaVideo::fragmented(
+        Cursor::new(source),
+        Cursor::new(source),
+        source.len() as u64,
+    )
+    .unwrap();
+    let mut actual = MediaVideo::fragmented(
+        Cursor::new(&multiplexed),
+        Cursor::new(&multiplexed),
+        multiplexed.len() as u64,
+    )
+    .unwrap();
+    let mut frames = 0;
+    while let Some(expected) = expected.frame().unwrap() {
+        let actual = actual.frame().unwrap().unwrap();
+        assert_eq!(actual.0, expected.0);
+        assert_eq!(actual.1.rgba, expected.1.rgba);
+        frames += 1;
+    }
+    assert_eq!(frames, 48);
+    assert!(actual.frame().unwrap().is_none());
 }
 
 #[test]

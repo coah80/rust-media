@@ -341,10 +341,11 @@ impl<R: Read + Seek> FragmentVideo<R> {
         let mut expected_time = None;
         let mut first_time = None;
         for (moof, moof_offset) in parsed.moofs.iter().zip(moof_offsets) {
-            let traf = moof
+            let (traf_index, traf) = moof
                 .trafs
                 .iter()
-                .find(|traf| traf.tfhd.track_id == config.track)
+                .enumerate()
+                .find(|(_, traf)| traf.tfhd.track_id == config.track)
                 .ok_or("Missing video fragment track")?;
             let run = traf.trun.as_ref().ok_or("Missing video fragment run")?;
             if run.sample_count > 100_000 {
@@ -360,12 +361,7 @@ impl<R: Read + Seek> FragmentVideo<R> {
                 return Err("Video fragments are not contiguous".into());
             }
             first_time.get_or_insert(time);
-            let base = traf.tfhd.base_data_offset.unwrap_or(moof_offset);
-            let mut position = base
-                .checked_add_signed(i64::from(
-                    run.data_offset.ok_or("Missing video fragment offset")?,
-                ))
-                .ok_or("Invalid video fragment offset")?;
+            let mut position = fragment_data_start(moof, traf_index, moof_offset)?;
             for index in 0..run.sample_count as usize {
                 if samples.len() >= 1_000_000 {
                     return Err("Video exceeds the sample limit".into());
