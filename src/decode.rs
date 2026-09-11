@@ -1207,6 +1207,7 @@ pub(crate) fn validate_fragment_runs<R: Read + Seek>(
 ) -> Result<(), String> {
     let mut child = start;
     let mut boxes = 0usize;
+    let mut samples = 0usize;
     while child < end {
         if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
             return Err("Video fragment parsing cancelled".into());
@@ -1242,6 +1243,23 @@ pub(crate) fn validate_fragment_runs<R: Read + Seek>(
                     if runs > 1 {
                         return Err("Multiple video fragment runs are not supported".into());
                     }
+                    let payload = reader
+                        .stream_position()
+                        .map_err(|_| "Could not read video fragment")?;
+                    if nested_end - payload < 8 {
+                        return Err("Invalid video fragment run".into());
+                    }
+                    let mut header = [0; 8];
+                    reader
+                        .read_exact(&mut header)
+                        .map_err(|_| "Could not read video fragment")?;
+                    let sample_count =
+                        u32::from_be_bytes(header[4..8].try_into().unwrap()) as usize;
+                    if sample_count > 100_000 {
+                        return Err("Video fragment exceeds the sample limit".into());
+                    }
+                    ensure_fragment_sample_limit(samples, sample_count)?;
+                    samples += sample_count;
                 }
                 nested = nested_end;
             }

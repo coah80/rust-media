@@ -235,6 +235,16 @@ fn duplicate_first_trun(bytes: &[u8]) -> Vec<u8> {
     output
 }
 
+fn set_first_trun_sample_count(bytes: &[u8], count: u32) -> Vec<u8> {
+    let mut output = bytes.to_vec();
+    let trun = output
+        .windows(4)
+        .position(|value| value == b"trun")
+        .unwrap();
+    output[trun + 8..trun + 12].copy_from_slice(&count.to_be_bytes());
+    output
+}
+
 fn extend_mdat_headers(bytes: &[u8]) -> Vec<u8> {
     let mut source = bytes.to_vec();
     let mut offset = 0usize;
@@ -305,6 +315,11 @@ fn multiplex_eager_fragments(bytes: &[u8]) -> Vec<u8> {
                 .position(|value| value == b"hdlr")
                 .unwrap();
             foreign[hdlr + 12..hdlr + 16].copy_from_slice(b"soun");
+            let avc1 = foreign
+                .windows(4)
+                .position(|value| value == b"avc1")
+                .unwrap();
+            foreign[avc1..avc1 + 4].copy_from_slice(b"free");
             let mut moov = bytes[offset..end].to_vec();
             moov[..4].copy_from_slice(&((size + trak_size) as u32).to_be_bytes());
             moov.extend_from_slice(&foreign);
@@ -846,6 +861,20 @@ fn macroscope_multiple_fragment_runs_are_rejected() {
         Err(error) => error,
     };
     assert_eq!(error, "Multiple video fragment runs are not supported");
+}
+
+#[test]
+fn macroscope_fragment_run_sample_count_is_bounded_before_parsing() {
+    let bytes = set_first_trun_sample_count(include_bytes!("fixtures/fragmented.mp4"), u32::MAX);
+    let error = match MediaVideo::fragmented(
+        Cursor::new(&bytes),
+        Cursor::new(&bytes),
+        bytes.len() as u64,
+    ) {
+        Ok(_) => panic!("oversized fragment run was accepted"),
+        Err(error) => error,
+    };
+    assert_eq!(error, "Video fragment exceeds the sample limit");
 }
 
 #[test]
