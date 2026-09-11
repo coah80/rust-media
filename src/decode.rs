@@ -218,6 +218,14 @@ struct FragmentPlan {
     origin: u64,
 }
 
+#[derive(Clone, Copy)]
+struct TrackDefaults {
+    track: u32,
+    duration: u32,
+    size: u32,
+    flags: u32,
+}
+
 struct FragmentConfig {
     decoder: Decoder,
     header: Vec<u8>,
@@ -227,6 +235,7 @@ struct FragmentConfig {
     default_duration: Option<u32>,
     default_size: Option<u32>,
     default_flags: Option<u32>,
+    defaults: Vec<TrackDefaults>,
     offset: Option<u64>,
     audio: bool,
 }
@@ -247,6 +256,7 @@ pub struct FragmentVideo<R> {
     default_duration: Option<u32>,
     default_size: Option<u32>,
     default_flags: Option<u32>,
+    defaults: Vec<TrackDefaults>,
     segments: Vec<FragmentSegment>,
     segment: usize,
     segment_scale: f64,
@@ -279,9 +289,13 @@ impl<R: Read + Seek> FragmentVideo<R> {
         header_reader
             .seek(SeekFrom::Start(0))
             .map_err(|_| "Could not seek video initialization")?;
+        let defaults = fragment_defaults(&mut header_reader, header_end)?;
+        header_reader
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| "Could not seek video initialization")?;
         let parsed = mp4::Mp4Reader::read_header(&mut header_reader, header_end)
             .map_err(|_| "This video is not a supported fragmented MP4")?;
-        let config = fragment_config(&parsed)?;
+        let config = fragment_config(&parsed, defaults)?;
         let Some(plan) = plans.into_iter().find(|plan| plan.track == config.track) else {
             drop(parsed);
             header_reader
@@ -318,6 +332,7 @@ impl<R: Read + Seek> FragmentVideo<R> {
             default_duration: config.default_duration,
             default_size: config.default_size,
             default_flags: config.default_flags,
+            defaults: config.defaults,
             segments: plan.segments,
             segment: 0,
             segment_scale: f64::from(plan.timescale),
@@ -329,14 +344,18 @@ impl<R: Read + Seek> FragmentVideo<R> {
         Ok(video)
     }
 
-    fn new_eager(mut reader: R, header_reader: R, size: u64) -> Result<Self, String> {
+    fn new_eager(mut reader: R, mut header_reader: R, size: u64) -> Result<Self, String> {
         let (moof_offsets, mdats) = top_level_boxes(&mut reader, size)?;
+        let defaults = fragment_defaults(&mut header_reader, size)?;
+        header_reader
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| "Could not seek video initialization")?;
         let parsed = mp4::Mp4Reader::read_header(header_reader, size)
             .map_err(|_| "This video is not a supported fragmented MP4")?;
         if parsed.moofs.len() != moof_offsets.len() {
             return Err("The video fragment table is inconsistent".into());
         }
-        let config = fragment_config(&parsed)?;
+        let config = fragment_config(&parsed, defaults)?;
         let mut samples = Vec::new();
         let mut expected_time = None;
         let mut first_time = None;
@@ -361,7 +380,8 @@ impl<R: Read + Seek> FragmentVideo<R> {
                 return Err("Video fragments are not contiguous".into());
             }
             first_time.get_or_insert(time);
-            let mut position = fragment_data_start(moof, traf_index, moof_offset)?;
+            let mut position =
+                fragment_data_start(moof, traf_index, moof_offset, &config.defaults)?;
             for index in 0..run.sample_count as usize {
                 if samples.len() >= 1_000_000 {
                     return Err("Video exceeds the sample limit".into());
@@ -446,6 +466,7 @@ impl<R: Read + Seek> FragmentVideo<R> {
             default_duration: config.default_duration,
             default_size: config.default_size,
             default_flags: config.default_flags,
+            defaults: config.defaults,
             segments: Vec::new(),
             segment: 0,
             segment_scale: config.scale,
@@ -481,7 +502,7 @@ impl<R: Read + Seek> FragmentVideo<R> {
             if expected_time.is_some_and(|expected| expected != time) {
                 return Err("Video fragments are not contiguous".into());
             }
-            let mut position = fragment_data_start(&moof, traf_index, moof_offset)?;
+            let mut position = fragment_data_start(&moof, traf_index, moof_offset, &self.defaults)?;
             for sample_index in 0..run.sample_count as usize {
                 let duration = run
                     .sample_durations
@@ -622,6 +643,7 @@ fn fragment_data_start(
     moof: &mp4::MoofBox,
     target: usize,
     moof_offset: u64,
+    defaults: &[TrackDefaults],
 ) -> Result<u64, String> {
     let mut preceding_end = moof_offset;
     for (index, traf) in moof.trafs.iter().enumerate() {
@@ -646,6 +668,12 @@ fn fragment_data_start(
         } else if run.sample_sizes.is_empty() {
             traf.tfhd
                 .default_sample_size
+                .or_else(|| {
+                    defaults
+                        .iter()
+                        .find(|defaults| defaults.track == traf.tfhd.track_id)
+                        .map(|defaults| defaults.size)
+                })
                 .and_then(|size| u64::from(size).checked_mul(u64::from(run.sample_count)))
         } else {
             None
@@ -717,7 +745,95 @@ impl<R: Read + Seek> MediaVideo<R> {
     }
 }
 
-fn fragment_config<R: Read + Seek>(parsed: &mp4::Mp4Reader<R>) -> Result<FragmentConfig, String> {
+fn fragment_defaults<R: Read + Seek>(
+    reader: &mut R,
+    size: u64,
+) -> Result<Vec<TrackDefaults>, String> {
+    let mut defaults = Vec::new();
+    let mut offset = 0u64;
+    let mut boxes = 0usize;
+    while offset < size {
+        boxes += 1;
+        if boxes > 100_000 {
+            return Err("Video exceeds the box limit".into());
+        }
+        reader
+            .seek(SeekFrom::Start(offset))
+            .map_err(|_| "Could not seek video initialization")?;
+        let (kind, _, end) = box_header(reader, offset, size)?;
+        let payload = reader
+            .stream_position()
+            .map_err(|_| "Could not read video initialization")?;
+        if &kind != b"moov" {
+            offset = end;
+            continue;
+        }
+        let mut child = payload;
+        while child < end {
+            boxes += 1;
+            if boxes > 100_000 {
+                return Err("Video exceeds the box limit".into());
+            }
+            reader
+                .seek(SeekFrom::Start(child))
+                .map_err(|_| "Could not seek video initialization")?;
+            let (child_kind, _, child_end) = box_header(reader, child, end)?;
+            let child_payload = reader
+                .stream_position()
+                .map_err(|_| "Could not read video initialization")?;
+            if &child_kind == b"mvex" {
+                let mut nested = child_payload;
+                while nested < child_end {
+                    boxes += 1;
+                    if boxes > 100_000 {
+                        return Err("Video exceeds the box limit".into());
+                    }
+                    reader
+                        .seek(SeekFrom::Start(nested))
+                        .map_err(|_| "Could not seek video initialization")?;
+                    let (nested_kind, _, nested_end) = box_header(reader, nested, child_end)?;
+                    let nested_payload = reader
+                        .stream_position()
+                        .map_err(|_| "Could not read video initialization")?;
+                    if &nested_kind == b"trex" {
+                        if nested_end - nested_payload < 24 || defaults.len() >= 256 {
+                            return Err("Invalid video track defaults".into());
+                        }
+                        reader
+                            .seek(SeekFrom::Start(nested_payload))
+                            .map_err(|_| "Could not seek video initialization")?;
+                        let mut bytes = [0; 24];
+                        reader
+                            .read_exact(&mut bytes)
+                            .map_err(|_| "Could not read video initialization")?;
+                        let track = u32::from_be_bytes(bytes[4..8].try_into().unwrap());
+                        if defaults
+                            .iter()
+                            .any(|defaults: &TrackDefaults| defaults.track == track)
+                        {
+                            return Err("Duplicate video track defaults".into());
+                        }
+                        defaults.push(TrackDefaults {
+                            track,
+                            duration: u32::from_be_bytes(bytes[12..16].try_into().unwrap()),
+                            size: u32::from_be_bytes(bytes[16..20].try_into().unwrap()),
+                            flags: u32::from_be_bytes(bytes[20..24].try_into().unwrap()),
+                        });
+                    }
+                    nested = nested_end;
+                }
+            }
+            child = child_end;
+        }
+        break;
+    }
+    Ok(defaults)
+}
+
+fn fragment_config<R: Read + Seek>(
+    parsed: &mp4::Mp4Reader<R>,
+    defaults: Vec<TrackDefaults>,
+) -> Result<FragmentConfig, String> {
     let track = parsed
         .tracks()
         .values()
@@ -759,12 +875,7 @@ fn fragment_config<R: Read + Seek>(parsed: &mp4::Mp4Reader<R>) -> Result<Fragmen
         .tracks()
         .values()
         .any(|track| track.media_type().ok() == Some(mp4::MediaType::AAC));
-    let trex = parsed
-        .moov
-        .mvex
-        .as_ref()
-        .map(|mvex| &mvex.trex)
-        .filter(|trex| trex.track_id == track_id);
+    let trex = defaults.iter().find(|defaults| defaults.track == track_id);
     let offset = if let Some(edits) = track
         .trak
         .edts
@@ -797,9 +908,10 @@ fn fragment_config<R: Read + Seek>(parsed: &mp4::Mp4Reader<R>) -> Result<Fragmen
         track: track_id,
         length: usize::from(avc.avcc.length_size_minus_one & 3) + 1,
         scale: f64::from(track.timescale()),
-        default_duration: trex.map(|value| value.default_sample_duration),
-        default_size: trex.map(|value| value.default_sample_size),
-        default_flags: trex.map(|value| value.default_sample_flags),
+        default_duration: trex.map(|value| value.duration),
+        default_size: trex.map(|value| value.size),
+        default_flags: trex.map(|value| value.flags),
+        defaults,
         offset,
         audio,
     })
@@ -1192,7 +1304,7 @@ mod tests {
         let bytes = include_bytes!("../tests/fixtures/audio-video.mp4");
         let parsed =
             mp4::Mp4Reader::read_header(std::io::Cursor::new(bytes), bytes.len() as u64).unwrap();
-        assert!(fragment_config(&parsed).unwrap().audio);
+        assert!(fragment_config(&parsed, Vec::new()).unwrap().audio);
     }
 
     #[test]
@@ -1255,10 +1367,57 @@ mod tests {
         video_run.data_offset = Some(5);
         video_run.sample_sizes = vec![7];
         moof.trafs = vec![audio, video];
-        assert_eq!(fragment_data_start(&moof, 1, 1000).unwrap(), 1115);
+        assert_eq!(fragment_data_start(&moof, 1, 1000, &[]).unwrap(), 1115);
         moof.trafs[1].trun.as_mut().unwrap().data_offset = None;
-        assert_eq!(fragment_data_start(&moof, 1, 1000).unwrap(), 1110);
+        assert_eq!(fragment_data_start(&moof, 1, 1000, &[]).unwrap(), 1110);
         moof.trafs[1].tfhd.flags = 0x020000;
-        assert_eq!(fragment_data_start(&moof, 1, 1000).unwrap(), 1000);
+        assert_eq!(fragment_data_start(&moof, 1, 1000, &[]).unwrap(), 1000);
+        moof.trafs[1].tfhd.flags = 0;
+        moof.trafs[0].trun.as_mut().unwrap().sample_sizes.clear();
+        moof.trafs[0].tfhd.default_sample_size = None;
+        assert_eq!(
+            fragment_data_start(
+                &moof,
+                1,
+                1000,
+                &[TrackDefaults {
+                    track: 1,
+                    duration: 0,
+                    size: 5,
+                    flags: 0,
+                }],
+            )
+            .unwrap(),
+            1110
+        );
+    }
+
+    #[test]
+    fn macroscope_collects_all_track_fragment_defaults() {
+        let trex = |track: u32, size: u32| {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&32u32.to_be_bytes());
+            bytes.extend_from_slice(b"trex");
+            bytes.extend_from_slice(&[0; 4]);
+            bytes.extend_from_slice(&track.to_be_bytes());
+            bytes.extend_from_slice(&1u32.to_be_bytes());
+            bytes.extend_from_slice(&3000u32.to_be_bytes());
+            bytes.extend_from_slice(&size.to_be_bytes());
+            bytes.extend_from_slice(&0x10000u32.to_be_bytes());
+            bytes
+        };
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&80u32.to_be_bytes());
+        bytes.extend_from_slice(b"moov");
+        bytes.extend_from_slice(&72u32.to_be_bytes());
+        bytes.extend_from_slice(b"mvex");
+        bytes.extend_from_slice(&trex(1, 5));
+        bytes.extend_from_slice(&trex(2, 7));
+        let defaults = fragment_defaults(&mut std::io::Cursor::new(&bytes), 80).unwrap();
+        assert_eq!(defaults.len(), 2);
+        assert_eq!(defaults[0].track, 1);
+        assert_eq!(defaults[0].size, 5);
+        assert_eq!(defaults[1].track, 2);
+        assert_eq!(defaults[1].size, 7);
     }
 }
