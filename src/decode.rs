@@ -4,6 +4,7 @@ use rusty_h264_decoder::Decoder;
 use std::{
     io::{Read, Seek, SeekFrom},
     ops::Range,
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 pub struct Video<R> {
@@ -852,7 +853,7 @@ fn segment_boxes<R: Read + Seek>(
                 if reader.stream_position().ok() != Some(offset + 8) {
                     return Err("Unsupported extended video fragment".into());
                 }
-                validate_fragment_runs(reader, offset + 8, end)?;
+                validate_fragment_runs(reader, offset + 8, end, None)?;
                 reader
                     .seek(SeekFrom::Start(offset + 8))
                     .map_err(|_| "Could not seek video fragment")?;
@@ -953,7 +954,7 @@ fn top_level_boxes<R: Read + Seek>(
             .ok_or("Invalid video fragment box")?;
         match &header[4..8] {
             b"moof" => {
-                validate_fragment_runs(reader, offset + header_size, end)?;
+                validate_fragment_runs(reader, offset + header_size, end, None)?;
                 moofs.push(offset);
             }
             b"mdat" => mdats.push(offset + header_size..end),
@@ -979,10 +980,14 @@ pub(crate) fn validate_fragment_runs<R: Read + Seek>(
     reader: &mut R,
     start: u64,
     end: u64,
+    cancel: Option<&AtomicBool>,
 ) -> Result<(), String> {
     let mut child = start;
     let mut boxes = 0usize;
     while child < end {
+        if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+            return Err("Video fragment parsing cancelled".into());
+        }
         boxes += 1;
         if boxes > 100_000 {
             return Err("Video fragment exceeds the box limit".into());
@@ -998,6 +1003,9 @@ pub(crate) fn validate_fragment_runs<R: Read + Seek>(
             let mut nested = payload_start;
             let mut runs = 0usize;
             while nested < child_end {
+                if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+                    return Err("Video fragment parsing cancelled".into());
+                }
                 boxes += 1;
                 if boxes > 100_000 {
                     return Err("Video fragment exceeds the box limit".into());

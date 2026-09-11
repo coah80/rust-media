@@ -16,6 +16,9 @@ fn remux_inner(data: &[u8], cancel: &AtomicBool) -> Result<Vec<u8>, Box<dyn std:
     let mut moofs = Vec::new();
     let mut mdats = Vec::new();
     while offset < data.len() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("assembly cancelled".into());
+        }
         box_count += 1;
         if box_count > 100_000 {
             return Err("too many top-level boxes".into());
@@ -42,6 +45,7 @@ fn remux_inner(data: &[u8], cancel: &AtomicBool) -> Result<Vec<u8>, Box<dyn std:
                 &mut reader,
                 (offset + header_size) as u64,
                 (offset + size) as u64,
+                Some(cancel),
             )?;
             moofs.push(offset);
         }
@@ -51,6 +55,9 @@ fn remux_inner(data: &[u8], cancel: &AtomicBool) -> Result<Vec<u8>, Box<dyn std:
         offset += size;
     }
     let reader = mp4::Mp4Reader::read_header(Cursor::new(data), data.len() as u64)?;
+    if cancel.load(Ordering::Relaxed) {
+        return Err("assembly cancelled".into());
+    }
     if reader.tracks().len() != 1 || moofs.len() != reader.moofs.len() {
         return Err("invalid tracks".into());
     }

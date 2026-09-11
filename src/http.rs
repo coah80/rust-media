@@ -3,42 +3,13 @@ use std::{
     io::{self, Read, Seek, SeekFrom},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
 
 const BLOCK: u64 = 512 * 1024;
 const MAX_SIZE: u64 = 2 * 1024 * 1024 * 1024;
-const MAX_BODY_READERS: usize = 2;
-static BODY_READERS: AtomicUsize = AtomicUsize::new(0);
-
-struct BodyReaderPermit;
-
-impl BodyReaderPermit {
-    fn acquire(cancel: &AtomicBool) -> io::Result<Self> {
-        loop {
-            if cancel.load(Ordering::Relaxed) {
-                return Err(io::ErrorKind::Interrupted.into());
-            }
-            if BODY_READERS
-                .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |active| {
-                    (active < MAX_BODY_READERS).then_some(active + 1)
-                })
-                .is_ok()
-            {
-                return Ok(Self);
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-}
-
-impl Drop for BodyReaderPermit {
-    fn drop(&mut self) {
-        BODY_READERS.fetch_sub(1, Ordering::Release);
-    }
-}
 
 #[derive(Default)]
 struct Cache {
@@ -107,7 +78,7 @@ pub fn allowed(value: &str) -> bool {
 
 #[derive(Clone)]
 pub struct RemoteFile {
-    client: reqwest::blocking::Client,
+    client: reqwest::Client,
     url: String,
     cancel: Arc<AtomicBool>,
     position: u64,
@@ -157,7 +128,7 @@ impl RemoteFile {
         if !allowed(url) {
             return Err("Unsupported video address".into());
         }
-        let client = reqwest::blocking::Client::builder()
+        let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(8))
             .timeout(Duration::from_secs(15))
@@ -226,18 +197,32 @@ impl RemoteFile {
         end: u64,
         allow_initial: bool,
     ) -> io::Result<(u64, u64, Vec<u8>)> {
+        crate::request::run(self.request_block_from_async(initial_url, start, end, allow_initial))
+            .map_err(io::Error::other)?
+    }
+
+    async fn request_block_from_async(
+        &self,
+        initial_url: &str,
+        start: u64,
+        end: u64,
+        allow_initial: bool,
+    ) -> io::Result<(u64, u64, Vec<u8>)> {
         let mut url = initial_url.to_owned();
         for redirect in 0..5 {
             if (!allow_initial || redirect > 0) && !allowed(&url) {
                 return Err(io::ErrorKind::PermissionDenied.into());
             }
-            let response = self
+            let request = self
                 .client
                 .get(&url)
                 .header("Range", format!("bytes={start}-{end}"))
-                .header("Accept-Encoding", "identity")
-                .send()
-                .map_err(io::Error::other)?;
+                .header("Accept-Encoding", "identity");
+            let response = tokio::select! {
+                biased;
+                _ = cancelled(&self.cancel) => return Err(io::ErrorKind::Interrupted.into()),
+                response = request.send() => response.map_err(io::Error::other)?,
+            };
             if response.status().is_redirection() {
                 let location = response
                     .headers()
@@ -290,7 +275,7 @@ impl RemoteFile {
                 }
                 (0, size, size)
             };
-            let bytes = read_body(response, limit + 1, &self.cancel)?;
+            let bytes = read_body(response, limit + 1, &self.cancel).await?;
             if bytes.len() as u64 != limit || self.cancel.load(Ordering::Relaxed) {
                 return Err(io::ErrorKind::UnexpectedEof.into());
             }
@@ -300,33 +285,32 @@ impl RemoteFile {
     }
 }
 
-fn read_body(
-    response: reqwest::blocking::Response,
+async fn cancelled(cancel: &AtomicBool) {
+    while !cancel.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+async fn read_body(
+    mut response: reqwest::Response,
     limit: u64,
     cancel: &AtomicBool,
 ) -> io::Result<Vec<u8>> {
-    let permit = BodyReaderPermit::acquire(cancel)?;
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    std::thread::Builder::new()
-        .name("rust-media-body".into())
-        .spawn(move || {
-            let _permit = permit;
-            let mut bytes = Vec::new();
-            let result = response.take(limit).read_to_end(&mut bytes).map(|_| bytes);
-            let _ = sender.send(result);
-        })
-        .map_err(io::Error::other)?;
+    let limit = usize::try_from(limit).map_err(io::Error::other)?;
+    let mut bytes = Vec::new();
     loop {
-        if cancel.load(Ordering::Relaxed) {
-            return Err(io::ErrorKind::Interrupted.into());
+        let chunk = tokio::select! {
+            biased;
+            _ = cancelled(cancel) => return Err(io::ErrorKind::Interrupted.into()),
+            chunk = response.chunk() => chunk.map_err(io::Error::other)?,
+        };
+        let Some(chunk) = chunk else {
+            return Ok(bytes);
+        };
+        if chunk.len() > limit - bytes.len() {
+            return Err(io::ErrorKind::InvalidData.into());
         }
-        match receiver.recv_timeout(Duration::from_millis(25)) {
-            Ok(result) => return result,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(io::Error::other("Video response reader stopped"));
-            }
-        }
+        bytes.extend_from_slice(&chunk);
     }
 }
 
@@ -477,7 +461,7 @@ mod tests {
         cache.store(0, Arc::from([0, 1]), 4);
         cache.store(2, Arc::from([2, 3]), 4);
         let mut file = RemoteFile {
-            client: reqwest::blocking::Client::new(),
+            client: reqwest::Client::new(),
             url: String::new(),
             cancel: Arc::new(AtomicBool::new(false)),
             position: 2,
@@ -521,7 +505,7 @@ mod tests {
         });
         let cancel = Arc::new(AtomicBool::new(false));
         let file = RemoteFile {
-            client: reqwest::blocking::Client::builder()
+            client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(15))
                 .build()
                 .unwrap(),
@@ -551,7 +535,7 @@ mod tests {
     }
 
     #[test]
-    fn macroscope_cancelled_body_reads_are_bounded() {
+    fn macroscope_cancelled_body_reads_are_closed() {
         use std::{
             io::{Read, Write},
             net::TcpListener,
@@ -602,7 +586,7 @@ mod tests {
             }
         });
         let file = RemoteFile {
-            client: reqwest::blocking::Client::builder()
+            client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(15))
                 .build()
                 .unwrap(),
@@ -634,6 +618,6 @@ mod tests {
             .filter(|_| held_rx.recv_timeout(Duration::from_secs(1)).unwrap())
             .count();
         server.join().unwrap();
-        assert!(held <= 2, "{held} cancelled body readers remained active");
+        assert_eq!(held, 0, "cancelled body readers remained active");
     }
 }

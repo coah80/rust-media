@@ -1,10 +1,37 @@
 use std::{
+    future::Future,
     sync::{
         OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
+
+static RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
+
+pub(crate) fn run<T: Send>(future: impl Future<Output = T> + Send) -> Result<T, String> {
+    let runtime = RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .max_blocking_threads(2)
+                .enable_all()
+                .build()
+                .map_err(|_| "Could not start video networking".into())
+        })
+        .as_ref()
+        .map_err(Clone::clone)?;
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(move || runtime.block_on(future))
+                .join()
+                .map_err(|_| "Video networking failed".into())
+        })
+    } else {
+        Ok(runtime.block_on(future))
+    }
+}
 
 pub(crate) struct Client(reqwest::Client);
 
@@ -36,84 +63,60 @@ impl Client {
         cancel: &AtomicBool,
         deadline: Instant,
     ) -> Result<Vec<u8>, String> {
-        static RUNTIME: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
-        let runtime = RUNTIME
-            .get_or_init(|| {
-                tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(1)
-                    .max_blocking_threads(2)
-                    .enable_all()
-                    .build()
-                    .map_err(|_| "Could not start video networking".into())
-            })
-            .as_ref()
-            .map_err(Clone::clone)?;
-        let execute = move || {
-            runtime.block_on(async move {
-                let interrupted = async {
-                    loop {
-                        if cancel.load(Ordering::Relaxed) {
-                            break "Video loading cancelled";
-                        }
-                        if Instant::now() >= deadline {
-                            break "Video loading timed out";
-                        }
-                        tokio::time::sleep(Duration::from_millis(20)).await;
+        run(async move {
+            let interrupted = async {
+                loop {
+                    if cancel.load(Ordering::Relaxed) {
+                        break "Video loading cancelled";
                     }
-                };
-                let receive = async {
-                    let mut response = request
-                        .send()
-                        .await
-                        .map_err(|_| "Could not reach the video provider")?;
-                    if !response.status().is_success() {
-                        return Err(format!(
-                            "Video provider refused the request, HTTP {}",
-                            response.status().as_u16()
-                        ));
+                    if Instant::now() >= deadline {
+                        break "Video loading timed out";
                     }
-                    if response
-                        .content_length()
-                        .is_some_and(|size| size > max as u64)
-                    {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            };
+            let receive = async {
+                let mut response = request
+                    .send()
+                    .await
+                    .map_err(|_| "Could not reach the video provider")?;
+                if !response.status().is_success() {
+                    return Err(format!(
+                        "Video provider refused the request, HTTP {}",
+                        response.status().as_u16()
+                    ));
+                }
+                if response
+                    .content_length()
+                    .is_some_and(|size| size > max as u64)
+                {
+                    return Err("Video response exceeds the size limit".into());
+                }
+                let mut bytes = Vec::new();
+                while let Some(chunk) = response
+                    .chunk()
+                    .await
+                    .map_err(|_| "Video response was interrupted")?
+                {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err("Video loading cancelled".into());
+                    }
+                    if Instant::now() >= deadline {
+                        return Err("Video loading timed out".into());
+                    }
+                    if chunk.len() > max - bytes.len() {
                         return Err("Video response exceeds the size limit".into());
                     }
-                    let mut bytes = Vec::new();
-                    while let Some(chunk) = response
-                        .chunk()
-                        .await
-                        .map_err(|_| "Video response was interrupted")?
-                    {
-                        if cancel.load(Ordering::Relaxed) {
-                            return Err("Video loading cancelled".into());
-                        }
-                        if Instant::now() >= deadline {
-                            return Err("Video loading timed out".into());
-                        }
-                        if chunk.len() > max - bytes.len() {
-                            return Err("Video response exceeds the size limit".into());
-                        }
-                        bytes.extend_from_slice(&chunk);
-                    }
-                    Ok(bytes)
-                };
-                tokio::select! {
-                    biased;
-                    reason = interrupted => Err(reason.into()),
-                    result = receive => result,
+                    bytes.extend_from_slice(&chunk);
                 }
-            })
-        };
-        if tokio::runtime::Handle::try_current().is_ok() {
-            std::thread::scope(|scope| {
-                scope
-                    .spawn(execute)
-                    .join()
-                    .unwrap_or_else(|_| Err("Video networking failed".into()))
-            })
-        } else {
-            execute()
-        }
+                Ok(bytes)
+            };
+            tokio::select! {
+                biased;
+                reason = interrupted => Err(reason.into()),
+                result = receive => result,
+            }
+        })?
     }
 }
 
