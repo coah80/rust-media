@@ -1,4 +1,9 @@
-use crate::{Pixels, decode::Video, http::RemoteFile, providers};
+use crate::{
+    Pixels,
+    decode::MediaVideo,
+    http::{BufferProgress, RemoteFile},
+    providers,
+};
 use std::{
     fs::File,
     io::{self, Read, Seek, SeekFrom},
@@ -29,6 +34,7 @@ pub struct Snapshot {
     pub error: String,
     pub position: f64,
     pub duration: f64,
+    pub buffered: f64,
     pub pixels: Option<Pixels>,
     pub generation: u64,
 }
@@ -120,6 +126,7 @@ impl Player {
             error: state.error.clone(),
             position: state.position,
             duration: state.duration,
+            buffered: state.buffered,
             pixels: state.pixels.take(),
             generation: state.generation,
         }
@@ -189,6 +196,30 @@ impl MediaReader {
                 Some(Self::Memory(io::Cursor::new(prepared.audio.clone()))),
             ));
         }
+        if resolved.progressive {
+            let video =
+                RemoteFile::open_progressive(&resolved.video, cancel.clone(), 128 * 1024 * 1024)?;
+            let audio = resolved
+                .audio
+                .as_ref()
+                .map(|url| {
+                    RemoteFile::open_progressive(url, cancel.clone(), 128 * 1024 * 1024)
+                        .map(Self::Remote)
+                })
+                .transpose()?;
+            let total = video
+                .size
+                .checked_add(audio.as_ref().map_or(0, Self::size))
+                .ok_or("Video exceeds the progressive loading limit")?;
+            if total > 128 * 1024 * 1024 {
+                return Err("Video exceeds the progressive loading limit".into());
+            }
+            video.start_prefetch();
+            if let Some(Self::Remote(audio)) = &audio {
+                audio.start_prefetch();
+            }
+            return Ok((Self::Remote(video), audio));
+        }
         Ok((
             Self::open(&resolved.video, cancel.clone())?,
             resolved
@@ -233,6 +264,12 @@ impl MediaReader {
             }
         }
     }
+    pub fn progress(&self) -> Option<BufferProgress> {
+        match self {
+            Self::Remote(file) => file.progress(),
+            _ => None,
+        }
+    }
 }
 impl Read for MediaReader {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
@@ -264,10 +301,16 @@ fn playback(
         return Ok(());
     }
     let (source, audio_source) = MediaReader::resolved(&resolved, cancel.clone())?;
+    let progress = source.progress();
+    let audio_progress = audio_source.as_ref().and_then(MediaReader::progress);
     let size = source.size();
-    let mut video = Video::new(source.duplicate()?, size)?;
+    let mut video = if resolved.fragmented {
+        MediaVideo::fragmented(source.duplicate()?, source.duplicate()?, size)?
+    } else {
+        MediaVideo::standard(source.duplicate()?, size)?
+    };
     let mut next = video.frame()?;
-    let audio = if video.audio || audio_source.is_some() {
+    let audio = if video.has_audio() || audio_source.is_some() {
         let source = audio_source.unwrap_or(source);
         let mut output = rodio::DeviceSinkBuilder::open_default_sink()
             .map_err(|_| "No audio output device is available")?;
@@ -293,7 +336,7 @@ fn playback(
             (controls.paused, controls.volume, controls.seek.take())
         };
         if let Some(seek) = seek {
-            time = seek.clamp(0., video.duration);
+            time = seek.clamp(0., video.duration());
             if let Some((_, player, _, _)) = &audio {
                 player.pause();
             }
@@ -355,7 +398,7 @@ fn playback(
             pixels = next.take().map(|(_, pixels)| pixels);
             next = video.frame()?;
         }
-        if next.is_none() && time >= video.duration - 0.05 {
+        if next.is_none() && time >= video.duration() - 0.05 {
             ended = true;
         }
         let mut state = shared.snapshot.lock().unwrap();
@@ -365,8 +408,13 @@ fn playback(
         if pixels.is_some() {
             state.pixels = pixels;
         }
-        state.position = time.min(video.duration);
-        state.duration = video.duration;
+        state.position = time.min(video.duration());
+        state.duration = video.duration();
+        state.buffered = match (&progress, &audio_progress) {
+            (Some(video), Some(audio)) => video.fraction().min(audio.fraction()),
+            (Some(progress), None) | (None, Some(progress)) => progress.fraction(),
+            (None, None) => 1.,
+        };
         state.title.clone_from(&resolved.title);
         state.provider.clone_from(&resolved.provider);
         state.status = if ended {

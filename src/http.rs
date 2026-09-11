@@ -1,14 +1,58 @@
 use std::{
+    collections::BTreeMap,
     io::{self, Read, Seek, SeekFrom},
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
 
 const BLOCK: u64 = 512 * 1024;
 const MAX_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+
+#[derive(Default)]
+struct Cache {
+    blocks: Mutex<BTreeMap<u64, Arc<[u8]>>>,
+    size: AtomicU64,
+    prefix: AtomicU64,
+}
+
+impl Cache {
+    fn get(&self, position: u64) -> Option<(u64, Arc<[u8]>)> {
+        let blocks = self.blocks.lock().unwrap();
+        let (&start, bytes) = blocks.range(..=position).next_back()?;
+        (position < start + bytes.len() as u64).then(|| (start, bytes.clone()))
+    }
+
+    fn store(&self, start: u64, bytes: Arc<[u8]>, size: u64) {
+        self.size.store(size, Ordering::Relaxed);
+        let mut blocks = self.blocks.lock().unwrap();
+        blocks.entry(start).or_insert(bytes);
+        let mut prefix = 0;
+        for (&start, bytes) in blocks.iter() {
+            if start > prefix {
+                break;
+            }
+            prefix = prefix.max(start.saturating_add(bytes.len() as u64));
+        }
+        self.prefix.store(prefix.min(size), Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone)]
+pub struct BufferProgress(Arc<Cache>);
+
+impl BufferProgress {
+    pub fn fraction(&self) -> f64 {
+        let size = self.0.size.load(Ordering::Relaxed);
+        if size == 0 {
+            0.
+        } else {
+            self.0.prefix.load(Ordering::Relaxed) as f64 / size as f64
+        }
+    }
+}
 
 pub fn allowed(value: &str) -> bool {
     reqwest::Url::parse(value).is_ok_and(|url| {
@@ -40,11 +84,46 @@ pub struct RemoteFile {
     position: u64,
     pub size: u64,
     start: u64,
-    bytes: Vec<u8>,
+    bytes: Arc<[u8]>,
+    cache: Option<Arc<Cache>>,
 }
 
 impl RemoteFile {
     pub fn open(url: &str, cancel: Arc<AtomicBool>) -> Result<Self, String> {
+        Self::open_inner(url, cancel, None)
+    }
+
+    pub fn open_progressive(
+        url: &str,
+        cancel: Arc<AtomicBool>,
+        max_size: u64,
+    ) -> Result<Self, String> {
+        let cache = Arc::new(Cache::default());
+        let file = Self::open_inner(url, cancel, Some(cache))?;
+        if file.size > max_size {
+            return Err("Video exceeds the progressive loading limit".into());
+        }
+        Ok(file)
+    }
+
+    pub fn start_prefetch(&self) {
+        let mut download = self.clone();
+        std::thread::spawn(move || {
+            let mut output = [0; 64 * 1024];
+            loop {
+                match download.read(&mut output) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+            }
+        });
+    }
+
+    fn open_inner(
+        url: &str,
+        cancel: Arc<AtomicBool>,
+        cache: Option<Arc<Cache>>,
+    ) -> Result<Self, String> {
         if !allowed(url) {
             return Err("Unsupported video address".into());
         }
@@ -61,16 +140,27 @@ impl RemoteFile {
             position: 0,
             size: 0,
             start: 0,
-            bytes: Vec::new(),
+            bytes: Arc::from([]),
+            cache,
         };
         file.load(0)
             .map_err(|_| "Video unavailable. Retry or open the original link")?;
         Ok(file)
     }
 
+    pub fn progress(&self) -> Option<BufferProgress> {
+        self.cache.clone().map(BufferProgress)
+    }
+
     fn load(&mut self, start: u64) -> io::Result<()> {
         if self.cancel.load(Ordering::Relaxed) {
             return Err(io::ErrorKind::Interrupted.into());
+        }
+        if let Some((actual_start, bytes)) = self.cache.as_ref().and_then(|cache| cache.get(start))
+        {
+            self.start = actual_start;
+            self.bytes = bytes;
+            return Ok(());
         }
         let end = start.saturating_add(BLOCK - 1).min(if self.size == 0 {
             MAX_SIZE
@@ -139,6 +229,10 @@ impl RemoteFile {
             if bytes.len() as u64 != limit || self.cancel.load(Ordering::Relaxed) {
                 return Err(io::ErrorKind::UnexpectedEof.into());
             }
+            let bytes: Arc<[u8]> = bytes.into();
+            if let Some(cache) = &self.cache {
+                cache.store(actual_start, bytes.clone(), size);
+            }
             self.size = size;
             self.start = actual_start;
             self.bytes = bytes;
@@ -184,6 +278,20 @@ impl Seek for RemoteFile {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn buffer_progress_stops_at_gaps() {
+        let cache = Arc::new(Cache::default());
+        let progress = BufferProgress(cache.clone());
+        cache.store(4, Arc::from([0; 4]), 12);
+        assert_eq!(progress.fraction(), 0.);
+        cache.store(0, Arc::from([0; 4]), 12);
+        assert!((progress.fraction() - 8. / 12.).abs() < f64::EPSILON);
+        cache.store(8, Arc::from([0; 4]), 12);
+        assert_eq!(progress.fraction(), 1.);
+    }
+
     #[test]
     fn media_destinations_are_restricted() {
         for url in [

@@ -1,5 +1,4 @@
 use serde_json::Value;
-use std::io::Read;
 use std::sync::{Arc, atomic::AtomicBool};
 use std::time::{Duration, Instant};
 
@@ -23,6 +22,8 @@ pub struct Resolved {
     pub title: String,
     pub provider: String,
     pub prepared: Option<Prepared>,
+    pub progressive: bool,
+    pub fragmented: bool,
 }
 
 pub fn resolve(input: &str) -> Result<Resolved, String> {
@@ -41,6 +42,8 @@ pub fn resolve_with_cancel(input: &str, cancel: Arc<AtomicBool>) -> Result<Resol
                 .into(),
             provider: "Local file".into(),
             prepared: None,
+            progressive: false,
+            fragmented: false,
         });
     }
     let url = reqwest::Url::parse(input).map_err(|_| "Invalid video URL")?;
@@ -68,6 +71,8 @@ pub fn resolve_with_cancel(input: &str, cancel: Arc<AtomicBool>) -> Result<Resol
             title: "Video".into(),
             provider: "Direct stream".into(),
             prepared: None,
+            progressive: false,
+            fragmented: false,
         }),
         _ => Err("This video host is not supported yet".into()),
     }
@@ -128,6 +133,8 @@ fn parse_fixtweet(value: &Value) -> Result<Resolved, String> {
             .unwrap_or_else(|| "Video".into()),
         provider: "FixupX".into(),
         prepared: None,
+        progressive: false,
+        fragmented: false,
     })
 }
 
@@ -201,6 +208,8 @@ fn youtube(id: &str, cancel: Arc<AtomicBool>) -> Result<Resolved, String> {
                 .into(),
             provider: "YouTube".into(),
             prepared: Some(prepared),
+            progressive: false,
+            fragmented: false,
         });
     }
     parse_youtube(&player)
@@ -219,20 +228,6 @@ fn youtube_visionos(
     if visitor.len() > 4096 {
         return Err("YouTube visitor data exceeds the limit".into());
     }
-    let asset = json_after(page, "\"jsUrl\":")
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .ok_or("Missing YouTube player script")?;
-    if !valid_player_asset(&asset) {
-        return Err("Invalid YouTube player script path".into());
-    }
-    let script = client.read(
-        client.get(&format!("https://www.youtube.com{asset}")),
-        8 * 1024 * 1024,
-        cancel,
-        Instant::now() + Duration::from_secs(20),
-    )?;
-    let script = std::str::from_utf8(&script).map_err(|_| "Invalid YouTube player script")?;
-    let timestamp = signature_timestamp(script).ok_or("Missing YouTube signature timestamp")?;
     let body = serde_json::json!({
         "context": {"client": {
             "clientName": "VISIONOS",
@@ -250,7 +245,6 @@ fn youtube_visionos(
         "videoId": id,
         "playbackContext": {"contentPlaybackContext": {
             "html5Preference": "HTML5_PREF_WANTS",
-            "signatureTimestamp": timestamp,
         }},
         "contentCheckOk": true,
         "racyCheckOk": true,
@@ -281,36 +275,49 @@ fn youtube_visionos(
     if duration == 0 || duration > 1200 || player["videoDetails"]["isLiveContent"] == true {
         return Err("YouTube clips must be recorded videos under 20 minutes".into());
     }
+    if let Some(resolved) = youtube_progressive(&player) {
+        return Ok(resolved);
+    }
     let mut resolved = parse_youtube(&player)?;
-    let audio_url = resolved
-        .audio
-        .take()
-        .ok_or("YouTube did not provide separate AAC audio")?;
-    let mut video_source = crate::http::RemoteFile::open(&resolved.video, cancel.clone())?;
-    if video_source.size > 128 * 1024 * 1024 {
-        return Err("YouTube clip exceeds the 128 MB loading limit".into());
-    }
-    let mut video = Vec::with_capacity(video_source.size as usize);
-    video_source
-        .read_to_end(&mut video)
-        .map_err(|_| "YouTube video download was interrupted")?;
-    let remaining = (128 * 1024 * 1024usize)
-        .checked_sub(video.len())
-        .ok_or("YouTube clip exceeds the 128 MB loading limit")?;
-    let mut audio_source = crate::http::RemoteFile::open(&audio_url, cancel.clone())?;
-    if audio_source.size > remaining as u64 {
-        return Err("YouTube clip exceeds the 128 MB loading limit".into());
-    }
-    let mut audio = Vec::with_capacity(audio_source.size as usize);
-    audio_source
-        .read_to_end(&mut audio)
-        .map_err(|_| "YouTube audio download was interrupted")?;
-    resolved.video.clear();
-    resolved.prepared = Some(Prepared {
-        video: crate::fragment::remux(&video, cancel)?.into(),
-        audio: audio.into(),
-    });
+    resolved.progressive = true;
+    resolved.fragmented = true;
     Ok(resolved)
+}
+
+fn youtube_progressive(player: &Value) -> Option<Resolved> {
+    if player["playabilityStatus"]["status"] != "OK" {
+        return None;
+    }
+    let video = player["streamingData"]["formats"]
+        .as_array()?
+        .iter()
+        .filter(|format| {
+            let mime = format["mimeType"].as_str().unwrap_or_default();
+            format["url"].as_str().is_some_and(crate::http::allowed)
+                && mime.starts_with("video/mp4")
+                && mime.contains("avc1")
+                && mime.contains("mp4a")
+                && format["height"].as_u64().unwrap_or(0) <= 720
+                && format["fps"].as_u64().unwrap_or(30) <= 30
+        })
+        .max_by_key(|format| {
+            (
+                format["height"].as_u64().unwrap_or(0),
+                format["bitrate"].as_u64().unwrap_or(0),
+            )
+        })?;
+    Some(Resolved {
+        video: video["url"].as_str()?.into(),
+        audio: None,
+        title: player["videoDetails"]["title"]
+            .as_str()
+            .unwrap_or("YouTube video")
+            .into(),
+        provider: "YouTube".into(),
+        prepared: None,
+        progressive: true,
+        fragmented: false,
+    })
 }
 
 fn json_after(text: &str, marker: &str) -> Option<Value> {
@@ -319,28 +326,6 @@ fn json_after(text: &str, marker: &str) -> Option<Value> {
         .into_iter::<Value>()
         .next()?
         .ok()
-}
-
-fn valid_player_asset(asset: &str) -> bool {
-    asset.starts_with("/s/player/")
-        && asset.len() <= 256
-        && asset
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"/_.-".contains(&byte))
-        && !asset.contains("..")
-        && !asset.contains('?')
-        && !asset.contains('#')
-}
-
-fn signature_timestamp(script: &str) -> Option<u64> {
-    ["signatureTimestamp", "\"sts\""]
-        .iter()
-        .flat_map(|marker| script.split(marker).skip(1))
-        .find_map(|rest| {
-            let rest = rest.trim_start().strip_prefix(':')?.trim_start();
-            let length = rest.bytes().take_while(u8::is_ascii_digit).take(10).count();
-            (length >= 5).then(|| rest[..length].parse().ok()).flatten()
-        })
 }
 
 fn parse_youtube(player: &Value) -> Result<Resolved, String> {
@@ -400,6 +385,8 @@ fn parse_youtube(player: &Value) -> Result<Resolved, String> {
             .into(),
         provider: "YouTube".into(),
         prepared: None,
+        progressive: false,
+        fragmented: false,
     })
 }
 
@@ -526,14 +513,6 @@ mod tests {
     fn youtube_selects_muxed_h264_or_separate_aac() {
         let player = serde_json::json!({"playabilityStatus":{"status":"OK"},"streamingData":{"formats":[{"url":"https://rr1.googlevideo.com/video","mimeType":"video/mp4; codecs=avc1,mp4a","height":360}]}});
         assert!(parse_youtube(&player).unwrap().audio.is_none());
-    }
-    #[test]
-    fn youtube_signature_timestamp_is_bounded() {
-        assert_eq!(
-            signature_timestamp("x signatureTimestamp:20702,y"),
-            Some(20702)
-        );
-        assert_eq!(signature_timestamp("x \"sts\" : 20703,y"), Some(20703));
-        assert_eq!(signature_timestamp("signatureTimestamp:12"), None);
+        assert!(youtube_progressive(&player).unwrap().progressive);
     }
 }
