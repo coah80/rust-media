@@ -274,6 +274,19 @@ fn extend_mdat_headers(bytes: &[u8]) -> Vec<u8> {
     output
 }
 
+fn prepend_foreign_sidx(bytes: &[u8]) -> Vec<u8> {
+    let kind = bytes.windows(4).position(|value| value == b"sidx").unwrap();
+    let start = kind - 4;
+    let size = u32::from_be_bytes(bytes[start..start + 4].try_into().unwrap()) as usize;
+    let mut foreign = bytes[start..start + size].to_vec();
+    foreign[12..16].copy_from_slice(&u32::MAX.to_be_bytes());
+    let mut output = Vec::with_capacity(bytes.len() + size);
+    output.extend_from_slice(&bytes[..start]);
+    output.extend_from_slice(&foreign);
+    output.extend_from_slice(&bytes[start..]);
+    output
+}
+
 #[test]
 fn fragment_offsets_preserve_every_decoded_frame() {
     let fragmented = include_bytes!("fixtures/fragmented.mp4");
@@ -573,4 +586,21 @@ fn macroscope_remux_accepts_extended_mdat() {
         assert_eq!(result.1.rgba, frame.1.rgba);
     }
     assert!(actual.frame().unwrap().is_none());
+}
+
+#[test]
+fn macroscope_indexed_video_skips_foreign_sidx() {
+    let (bytes, _) = indexed_fixture();
+    let bytes = prepend_foreign_sidx(&bytes);
+    let mut video = MediaVideo::fragmented(
+        Cursor::new(bytes.clone()),
+        Cursor::new(bytes.clone()),
+        bytes.len() as u64,
+    )
+    .unwrap();
+    let mut frames = 0;
+    while video.frame().unwrap().is_some() {
+        frames += 1;
+    }
+    assert_eq!(frames, 48);
 }

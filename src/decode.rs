@@ -213,6 +213,7 @@ struct FragmentSegment {
 
 struct FragmentPlan {
     segments: Vec<FragmentSegment>,
+    track: u32,
     timescale: u32,
     origin: u64,
 }
@@ -227,6 +228,7 @@ struct FragmentConfig {
     default_size: Option<u32>,
     default_flags: Option<u32>,
     offset: Option<u64>,
+    audio: bool,
 }
 
 type SegmentBoxes = (Vec<(mp4::MoofBox, u64)>, Vec<Range<u64>>);
@@ -250,29 +252,43 @@ pub struct FragmentVideo<R> {
     segment_scale: f64,
     segment_origin: f64,
     offset: f64,
+    audio: bool,
 }
 
 impl<R: Read + Seek> FragmentVideo<R> {
     fn new(mut reader: R, header_reader: R, size: u64) -> Result<Self, String> {
-        if let Some(plan) = fragment_plan(&mut reader, size)? {
-            return Self::new_indexed(reader, header_reader, plan);
+        let plans = fragment_plans(&mut reader, size)?;
+        if !plans.is_empty() {
+            return Self::new_indexed(reader, header_reader, size, plans);
         }
         Self::new_eager(reader, header_reader, size)
     }
 
-    fn new_indexed(reader: R, mut header_reader: R, plan: FragmentPlan) -> Result<Self, String> {
-        let header_end = plan
-            .segments
-            .first()
-            .ok_or("The video contains no media segments")?
-            .range
-            .start;
+    fn new_indexed(
+        reader: R,
+        mut header_reader: R,
+        size: u64,
+        plans: Vec<FragmentPlan>,
+    ) -> Result<Self, String> {
+        let header_end = plans
+            .iter()
+            .filter_map(|plan| plan.segments.first())
+            .map(|segment| segment.range.start)
+            .min()
+            .ok_or("The video contains no media segments")?;
         header_reader
             .seek(SeekFrom::Start(0))
             .map_err(|_| "Could not seek video initialization")?;
-        let parsed = mp4::Mp4Reader::read_header(header_reader, header_end)
+        let parsed = mp4::Mp4Reader::read_header(&mut header_reader, header_end)
             .map_err(|_| "This video is not a supported fragmented MP4")?;
         let config = fragment_config(&parsed)?;
+        let Some(plan) = plans.into_iter().find(|plan| plan.track == config.track) else {
+            drop(parsed);
+            header_reader
+                .seek(SeekFrom::Start(0))
+                .map_err(|_| "Could not seek video initialization")?;
+            return Self::new_eager(reader, header_reader, size);
+        };
         let offset = config
             .offset
             .map_or(plan.origin as f64 / f64::from(plan.timescale), |value| {
@@ -307,6 +323,7 @@ impl<R: Read + Seek> FragmentVideo<R> {
             segment_scale: f64::from(plan.timescale),
             segment_origin: offset * f64::from(plan.timescale),
             offset,
+            audio: config.audio,
         };
         video.load_segment(0)?;
         Ok(video)
@@ -438,6 +455,7 @@ impl<R: Read + Seek> FragmentVideo<R> {
             segment_scale: config.scale,
             segment_origin: 0.,
             offset: offset_ticks as f64 / config.scale,
+            audio: config.audio,
         })
     }
 
@@ -648,7 +666,7 @@ impl<R: Read + Seek> MediaVideo<R> {
     pub fn has_audio(&self) -> bool {
         match self {
             Self::Standard(video) => video.audio,
-            Self::Fragmented(_) => false,
+            Self::Fragmented(video) => video.audio,
         }
     }
 
@@ -705,6 +723,10 @@ fn fragment_config<R: Read + Seek>(parsed: &mp4::Mp4Reader<R>) -> Result<Fragmen
         .decode(&header)
         .map_err(|_| "Invalid video configuration")?;
     let track_id = track.track_id();
+    let audio = parsed
+        .tracks()
+        .values()
+        .any(|track| track.media_type().ok() == Some(mp4::MediaType::AAC));
     let trex = parsed
         .moov
         .mvex
@@ -747,15 +769,14 @@ fn fragment_config<R: Read + Seek>(parsed: &mp4::Mp4Reader<R>) -> Result<Fragmen
         default_size: trex.map(|value| value.default_sample_size),
         default_flags: trex.map(|value| value.default_sample_flags),
         offset,
+        audio,
     })
 }
 
-fn fragment_plan<R: Read + Seek>(
-    reader: &mut R,
-    size: u64,
-) -> Result<Option<FragmentPlan>, String> {
+fn fragment_plans<R: Read + Seek>(reader: &mut R, size: u64) -> Result<Vec<FragmentPlan>, String> {
     let mut offset = 0u64;
     let mut boxes = 0usize;
+    let mut plans = Vec::new();
     while offset < size {
         boxes += 1;
         if boxes > 100_000 {
@@ -766,7 +787,7 @@ fn fragment_plan<R: Read + Seek>(
             .map_err(|_| "Could not seek video initialization")?;
         let (kind, payload, end) = box_header(reader, offset, size)?;
         if &kind == b"moof" {
-            return Ok(None);
+            break;
         }
         if &kind != b"sidx" {
             offset = end;
@@ -777,7 +798,7 @@ fn fragment_plan<R: Read + Seek>(
             .read_exact(&mut version_flags)
             .map_err(|_| "Could not read video segment index")?;
         let version = version_flags[0];
-        let _reference_id = read_u32(reader)?;
+        let reference_id = read_u32(reader)?;
         let timescale = read_u32(reader)?;
         if timescale == 0 {
             return Err("Invalid video segment timescale".into());
@@ -830,13 +851,15 @@ fn fragment_plan<R: Read + Seek>(
                 .checked_add(u64::from(duration))
                 .ok_or("Invalid video segment duration")?;
         }
-        return Ok(Some(FragmentPlan {
+        plans.push(FragmentPlan {
             segments,
+            track: reference_id,
             timescale,
             origin: earliest,
-        }));
+        });
+        offset = end;
     }
-    Ok(None)
+    Ok(plans)
 }
 
 fn segment_boxes<R: Read + Seek>(
@@ -1130,5 +1153,13 @@ mod tests {
         assert_eq!(indexed_seek_segment(&segments, 2.), 0);
         assert_eq!(indexed_seek_segment(&segments, 3.), 0);
         assert_eq!(indexed_seek_segment(&segments, 4.), 3);
+    }
+
+    #[test]
+    fn macroscope_fragment_config_preserves_audio() {
+        let bytes = include_bytes!("../tests/fixtures/audio-video.mp4");
+        let parsed =
+            mp4::Mp4Reader::read_header(std::io::Cursor::new(bytes), bytes.len() as u64).unwrap();
+        assert!(fragment_config(&parsed).unwrap().audio);
     }
 }
