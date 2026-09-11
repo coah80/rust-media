@@ -1,0 +1,23 @@
+[package]
+name = "rust-webview-lab"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+blitz-dom = { version = "=0.3.0-beta.2", default-features = false, features = ["system-fonts"] }
+blitz-html = { version = "=0.3.0-beta.2", default-features = false }
+blitz-shell = { version = "=0.3.0-beta.2", default-features = false }
+blitz-traits = { version = "=0.3.0-beta.2", default-features = false }
+anyrender_vello_cpu = { version = "=0.17.0", features = ["softbuffer_window_renderer"] }
+boa_engine = { version = "=0.22.0", default-features = false }
+
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+lto = "thin"
+strip = true

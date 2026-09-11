@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Rust Webview Lab</title>
+<style>
+body { background: #313338; color: #f2f3f5; font: 16px sans-serif; margin: 32px; }
+h1 { font-size: 20px; font-weight: 600; margin: 0 0 24px; }
+button { background: #5865f2; color: white; border: 0; border-radius: 4px; padding: 10px 18px; font: inherit; }
+output { display: block; margin: 20px 0; font-size: 32px; }
+</style>
+</head>
+<body>
+<h1>DOM test</h1>
+<output id="count">0</output>
+<button id="change">Update text</button>
+<script>
+const count = document.querySelector('#count');
+document.querySelector('#change').addEventListener('click', () => {
+    count.textContent = String(Number(count.textContent) + 1);
+});
+</script>
+</body>
+</html>
