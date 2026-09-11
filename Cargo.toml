@@ -22,6 +22,11 @@ rodio = { version = "0.22.2", default-features = false, features = ["playback", 
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde_json = "1"
 slint = { version = "=1.17.1", optional = true, default-features = false, features = ["std", "backend-winit", "renderer-software", "renderer-femtovg", "accessibility", "compat-1-2"] }
+base64 = "0.22"
+ytdlp-ejs = { git = "https://github.com/ahaoboy/ytdlp-ejs", rev = "03399fa26ee36c823b9fb4fc0125381e9e968733", default-features = false, features = ["boa"] }
+prost = "0.13"
+boa_engine = "0.22"
+symphonia = { version = "0.5.5", default-features = false, features = ["aac", "isomp4"] }
 
 [build-dependencies]
 slint-build = { version = "=1.17.1", optional = true }
@@ -33,6 +38,12 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.rust-media]
 opt-level = 2
+[profile.dev.package.boa_parser]
+opt-level = 3
+[profile.dev.package.boa_engine]
+opt-level = 3
+[profile.dev.package.ytdlp-ejs]
+opt-level = 3
 
 [profile.release]
 lto = "thin"

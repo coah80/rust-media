@@ -19,7 +19,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .ok_or("Usage: rust-media --probe <video URL or file>")?;
         let start = Instant::now();
         let resolved = providers::resolve(input)?;
-        let source = MediaReader::open(&resolved.video, Arc::default())?;
+        let (source, _) = MediaReader::resolved(&resolved, Arc::default())?;
         let size = source.size();
         let mut decoder = Video::new(source, size)?;
         let mut count = 0;

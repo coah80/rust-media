@@ -1,24 +1,20 @@
-# Gates: native video experiment
+# Gates: native YouTube playback
 
-OWNS: src/**, ui/**, tests/**, docs/**, Cargo.toml, Cargo.lock, build.rs, README.md, GATES.md, .gitignore
+OWNS: src/**, ui/**, tests/**, docs/**, Cargo.toml, Cargo.lock, README.md, GATES.md
 
-Scope: an independent Rust media library and native player, with tested direct MP4 playback and measured provider limitations.
+Scope: native YouTube video/audio playback and controls, with broader provider verification tracked separately.
 
-- [x] G1: parser, request and playback-state regression tests pass
-  CHECK: cargo test --locked
-  EXPECT: test result: ok
-  EVIDENCE: automatic-evidence=v1; definition-sha256=903084afb67f2771e68383a3d2e415500fbb4dba1c69b3470044e5cd7d5c3ac5; exit=0; EXPECT=matched; output-sha256=27ed1162e668c3b0ab3832ec12b797ab5625a0cef6f1598886f7d1f6644dc746; output-bytes=1498; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\cole\projects\rust-media; path=aee1c3638993/51 entries
-
-- [x] G2: all targets pass strict lint
-  CHECK: cargo clippy --locked --all-targets -- -D warnings && echo CLIPPY_OK
-  EXPECT: CLIPPY_OK
-  EVIDENCE: automatic-evidence=v1; definition-sha256=d24b69f7a74027f6a4c44c7722f929a514b7c2bffbf54ead597c5dce8d226942; exit=0; EXPECT=matched; output-sha256=60a6548e79d7d723f31ea7c2179bd8ed5b32bf91b39d80507b5c92f9f36699a6; output-bytes=151; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\cole\projects\rust-media; path=aee1c3638993/51 entries
-
-- [x] G3: native playback and controls verified with both renderers
-  EVIDENCE: Windows native event-dispatch checks passed with winit-software and winit-femtovg. Generated H.264/AAC fixture exercised pause, paused seek, resume, mute, fullscreen, Escape, resize, EOF and replay. Final visual correction confirmed with software; same controls passed on live FixupX with femtovg. Screenshots inspected. Temporary driver removed before final source checks.
-
-- [x] G4: live provider probes recorded without claiming unsupported playback
-  EVIDENCE: FixupX resolved and decoded 60 frames at 482x360, 19.034-second duration, then passed native playback controls with audio. Follow-up public YouTube probes showed SABR-only metadata; the prior JavaScript diagnosis was incorrect. The corrected adapter reports unsupported SABR streaming, and docs/youtube.md records both failed public-video probes and rejected native-client requests. Local 720p probe decoded 60 frames in 0.786 seconds. No private responses or stream URLs committed.
-
-- [x] G5: independent GitHub repository contains the reviewed source and reproducible instructions
-  EVIDENCE: Private repository https://github.com/coah80/rust-media created and source pushed. GitHub main SHA matched local initial source commit e39fccd0dd91e678d8797a554e3d8d5b666711e2. README includes run commands, library usage, a generated-fixture screenshot, measured results and explicit YouTube/platform limitations. Final build and UI-free library check passed.
+- [x] Y1: complete public YouTube media decodes through Rust
+  EVIDENCE: Live full-clip check decoded all 284 ordered frames of jNQXAC9IVRw, 18.933 seconds of video and 19.064 seconds of AAC. No browser or external downloader.
+- [x] Y2: native audio/video playback, bounded loading and cancellation are verified
+  EVIDENCE: Active audio output drives the video clock; complete AAC decoding verified. Media loading capped at 128 MiB. Cancelling during URL resolution and replacing with a local file completed in 0.020 seconds after the resolver wait fix. One script worker at a time. Listening quality and perceptual lip sync unverified.
+- [x] Y3: native controls work on both renderers
+  EVIDENCE: Live YouTube passed pause across frames, paused seek, resume, mute, fullscreen, Escape, resize, EOF, replay and replacement on winit-software and winit-femtovg. Live FixupX passed the same controls. Temporary native event driver removed.
+- [x] Y4: regression tests and strict lint pass on the final source
+  CHECK: cargo test --locked && cargo clippy --locked --all-targets -- -D warnings && echo YOUTUBE_CHECKS_OK
+  EXPECT: YOUTUBE_CHECKS_OK
+  EVIDENCE: automatic-evidence=v1; definition-sha256=578d9cc43ef5ec061bbf25c43b2ef110d524950cb4772d5c5eb69f9ca1eeebd1; exit=0; EXPECT=matched; output-sha256=af9988ad10c5050e83853addae3ba066338691ea3b6cdddf696f89d8611223a7; output-bytes=2726; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\cole\projects\rust-media; path=aee1c3638993/51 entries
+- [ ] Y5: reviewed implementation and exact release build are published for review
+  EVIDENCE: Pending final build, source publication and PR update.
+- [ ] Y6: longer YouTube video plays completely through client verification
+  EVIDENCE: Unmet. aqz-KE-bpKQ delivered 62.2 seconds of video and 69.9 seconds of audio, then protection status 3 stopped delivery. The implemented transport now fails immediately on that status. Inspected verification integration uses Deno/V8 and was not added under the Rust-only constraint. This gate is not covered by the successful short clip.

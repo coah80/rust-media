@@ -170,6 +170,7 @@ fn run(shared: Arc<Shared>) {
 }
 
 pub enum MediaReader {
+    Memory(io::Cursor<Arc<[u8]>>),
     Remote(RemoteFile),
     Local {
         file: File,
@@ -178,6 +179,25 @@ pub enum MediaReader {
     },
 }
 impl MediaReader {
+    pub fn resolved(
+        resolved: &providers::Resolved,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<(Self, Option<Self>), String> {
+        if let Some(prepared) = &resolved.prepared {
+            return Ok((
+                Self::Memory(io::Cursor::new(prepared.video.clone())),
+                Some(Self::Memory(io::Cursor::new(prepared.audio.clone()))),
+            ));
+        }
+        Ok((
+            Self::open(&resolved.video, cancel.clone())?,
+            resolved
+                .audio
+                .as_ref()
+                .map(|url| Self::open(url, cancel.clone()))
+                .transpose()?,
+        ))
+    }
     pub fn open(input: &str, cancel: Arc<AtomicBool>) -> Result<Self, String> {
         if input.starts_with("https://") {
             return RemoteFile::open(input, cancel).map(Self::Remote);
@@ -199,12 +219,14 @@ impl MediaReader {
     }
     pub fn size(&self) -> u64 {
         match self {
+            Self::Memory(file) => file.get_ref().len() as u64,
             Self::Remote(file) => file.size,
             Self::Local { size, .. } => *size,
         }
     }
     fn duplicate(&self) -> Result<Self, String> {
         match self {
+            Self::Memory(file) => Ok(Self::Memory(file.clone())),
             Self::Remote(file) => Ok(Self::Remote(file.clone())),
             Self::Local { path, .. } => {
                 Self::open(path.to_str().ok_or("Invalid file path")?, Arc::default())
@@ -215,6 +237,7 @@ impl MediaReader {
 impl Read for MediaReader {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         match self {
+            Self::Memory(file) => file.read(bytes),
             Self::Remote(file) => file.read(bytes),
             Self::Local { file, .. } => file.read(bytes),
         }
@@ -223,6 +246,7 @@ impl Read for MediaReader {
 impl Seek for MediaReader {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         match self {
+            Self::Memory(file) => file.seek(pos),
             Self::Remote(file) => file.seek(pos),
             Self::Local { file, .. } => file.seek(pos),
         }
@@ -235,36 +259,25 @@ fn playback(
     generation: u64,
     shared: &Shared,
 ) -> Result<(), String> {
-    let resolved = providers::resolve(input)?;
+    let resolved = providers::resolve_with_cancel(input, cancel.clone())?;
     if cancel.load(Ordering::Relaxed) {
         return Ok(());
     }
-    let source = MediaReader::open(&resolved.video, cancel.clone())?;
+    let (source, audio_source) = MediaReader::resolved(&resolved, cancel.clone())?;
     let size = source.size();
-    let audio_source = if let Some(audio) = &resolved.audio {
-        Some(MediaReader::open(audio, cancel.clone())?)
-    } else {
-        None
-    };
     let mut video = Video::new(source.duplicate()?, size)?;
     let mut next = video.frame()?;
     let audio = if video.audio || audio_source.is_some() {
         let source = audio_source.unwrap_or(source);
-        let size = source.size();
         let mut output = rodio::DeviceSinkBuilder::open_default_sink()
             .map_err(|_| "No audio output device is available")?;
         output.log_on_drop(false);
-        let decoder = rodio::Decoder::builder()
-            .with_data(source)
-            .with_byte_len(size)
-            .with_hint("mp4")
-            .with_seekable(true)
-            .build()
-            .map_err(|_| "This audio codec is not supported yet")?;
+        let decoder = crate::audio::Audio::new(source.duplicate()?)?;
+        let error = decoder.error.clone();
         let player = rodio::Player::connect_new(output.mixer());
         player.pause();
         player.append(decoder);
-        Some((output, player))
+        Some((output, player, error, source))
     } else {
         None
     };
@@ -281,7 +294,7 @@ fn playback(
         };
         if let Some(seek) = seek {
             time = seek.clamp(0., video.duration);
-            if let Some((_, player)) = &audio {
+            if let Some((_, player, _, _)) = &audio {
                 player.pause();
             }
             video.seek(time)?;
@@ -292,7 +305,12 @@ fn playback(
                 }
                 next = video.frame()?;
             }
-            if let Some((_, player)) = &audio {
+            if let Some((_, player, error, source)) = &audio {
+                if player.empty() {
+                    let mut decoder = crate::audio::Audio::new(source.duplicate()?)?;
+                    decoder.error = error.clone();
+                    player.append(decoder);
+                }
                 player
                     .try_seek(Duration::from_secs_f64(time))
                     .map_err(|_| "Could not seek the audio")?;
@@ -308,7 +326,10 @@ fn playback(
                 next = video.frame()?;
             }
         }
-        if let Some((_, player)) = &audio {
+        if let Some((_, player, error, _)) = &audio {
+            if let Some(error) = error.lock().unwrap().as_ref() {
+                return Err(error.clone());
+            }
             player.set_volume(volume);
             if paused || ended {
                 player.pause();

@@ -1,5 +1,19 @@
 use serde_json::Value;
+use std::sync::{Arc, atomic::AtomicBool};
 use std::{io::Read, time::Duration};
+
+pub struct Prepared {
+    pub video: Arc<[u8]>,
+    pub audio: Arc<[u8]>,
+}
+impl std::fmt::Debug for Prepared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Prepared")
+            .field("video_bytes", &self.video.len())
+            .field("audio_bytes", &self.audio.len())
+            .finish()
+    }
+}
 
 #[derive(Debug)]
 pub struct Resolved {
@@ -7,9 +21,14 @@ pub struct Resolved {
     pub audio: Option<String>,
     pub title: String,
     pub provider: String,
+    pub prepared: Option<Prepared>,
 }
 
 pub fn resolve(input: &str) -> Result<Resolved, String> {
+    resolve_with_cancel(input, Arc::default())
+}
+
+pub fn resolve_with_cancel(input: &str, cancel: Arc<AtomicBool>) -> Result<Resolved, String> {
     if !input.contains("://") {
         return Ok(Resolved {
             video: input.into(),
@@ -20,6 +39,7 @@ pub fn resolve(input: &str) -> Result<Resolved, String> {
                 .to_string_lossy()
                 .into(),
             provider: "Local file".into(),
+            prepared: None,
         });
     }
     let url = reqwest::Url::parse(input).map_err(|_| "Invalid video URL")?;
@@ -35,9 +55,10 @@ pub fn resolve(input: &str) -> Result<Resolved, String> {
         | "www.youtube.com"
         | "m.youtube.com"
         | "youtu.be"
-        | "www.youtube-nocookie.com" => {
-            youtube(&youtube_id(&url).ok_or("Invalid YouTube video link")?)
-        }
+        | "www.youtube-nocookie.com" => youtube(
+            &youtube_id(&url).ok_or("Invalid YouTube video link")?,
+            cancel,
+        ),
         "fixupx.com" | "www.fixupx.com" | "fxtwitter.com" | "www.fxtwitter.com" | "x.com"
         | "twitter.com" => fixtweet(&status_id(&url).ok_or("Invalid post link")?),
         _ if crate::http::allowed(input) => Ok(Resolved {
@@ -45,6 +66,7 @@ pub fn resolve(input: &str) -> Result<Resolved, String> {
             audio: None,
             title: "Video".into(),
             provider: "Direct stream".into(),
+            prepared: None,
         }),
         _ => Err("This video host is not supported yet".into()),
     }
@@ -123,6 +145,7 @@ fn parse_fixtweet(value: &Value) -> Result<Resolved, String> {
             .map(|author| format!("Video by {author}"))
             .unwrap_or_else(|| "Video".into()),
         provider: "FixupX".into(),
+        prepared: None,
     })
 }
 
@@ -148,7 +171,7 @@ fn youtube_id(url: &reqwest::Url) -> Option<String> {
     .then_some(id)
 }
 
-fn youtube(id: &str) -> Result<Resolved, String> {
+fn youtube(id: &str, cancel: Arc<AtomicBool>) -> Result<Resolved, String> {
     let page = fetch(&format!("https://www.youtube.com/watch?v={id}&hl=en"))?;
     let text = std::str::from_utf8(&page).map_err(|_| "Invalid YouTube response")?;
     let player = [
@@ -164,6 +187,21 @@ fn youtube(id: &str) -> Result<Resolved, String> {
             .ok()
     })
     .ok_or("YouTube did not expose playable stream data")?;
+    if player["playabilityStatus"]["status"] == "OK"
+        && player["streamingData"]["serverAbrStreamingUrl"].is_string()
+    {
+        let prepared = crate::youtube::prepare(text, &player, cancel)?;
+        return Ok(Resolved {
+            video: String::new(),
+            audio: None,
+            title: player["videoDetails"]["title"]
+                .as_str()
+                .unwrap_or("YouTube video")
+                .into(),
+            provider: "YouTube".into(),
+            prepared: Some(prepared),
+        });
+    }
     parse_youtube(&player)
 }
 
@@ -223,6 +261,7 @@ fn parse_youtube(player: &Value) -> Result<Resolved, String> {
             .unwrap_or("YouTube video")
             .into(),
         provider: "YouTube".into(),
+        prepared: None,
     })
 }
 

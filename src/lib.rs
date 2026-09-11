@@ -1,7 +1,12 @@
+pub mod audio;
 pub mod decode;
+pub mod fragment;
 pub mod http;
 pub mod player;
 pub mod providers;
+mod sabr_proto;
+mod script;
+mod youtube;
 
 #[derive(Debug)]
 pub struct Pixels {
