@@ -63,7 +63,7 @@ All four probes decoded the entire video and AAC stream, reached the final times
 
 Run a complete probe with `cargo run --release --locked --features native -- --probe-all https://www.youtube.com/watch?v=VIDEO_ID`. Use `--probe` for startup plus up to 60 frames. Probes do not present frames in real time or play sound.
 
-After removing the temporary UI driver, the final release executable was rebuilt and all four startup probes passed again in sequence. First-frame times were 1.594 / 1.396 / 1.305 / 1.346 seconds in the table's video order; their 60-frame checksums matched the earlier runs. The local 90-frame 720p probe also retained checksum `aa7c17764dfb791d`. Final executable SHA-256: `4afe46b6991eaaece9b6b1c60017f9d7aecdfed04d27e20dfc650d30d3e0316c`.
+After removing the temporary UI driver, the final release executable was rebuilt and all four startup probes passed again in sequence. First-frame times were 1.594 / 1.396 / 1.305 / 1.346 seconds in the table's video order; their 60-frame checksums matched the earlier runs. The local 90-frame 720p probe also retained checksum `aa7c17764dfb791d`. Final executable SHA-256: `e2f529d7e0be106d511f76ab104aa9f48693858440bae76bc4f6cb376e7eb39b`.
 
 ## Remaining coverage limits
 
