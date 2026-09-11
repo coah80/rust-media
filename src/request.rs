@@ -21,15 +21,17 @@ pub(crate) fn run<T: Send>(future: impl Future<Output = T> + Send) -> Result<T, 
         })
         .as_ref()
         .map_err(Clone::clone)?;
-    if tokio::runtime::Handle::try_current().is_ok() {
-        std::thread::scope(|scope| {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::CurrentThread => {
+            Err("Synchronous video loading cannot run inside a single-thread Tokio runtime".into())
+        }
+        Ok(_) => std::thread::scope(|scope| {
             scope
                 .spawn(move || runtime.block_on(future))
                 .join()
                 .map_err(|_| "Video networking failed".into())
-        })
-    } else {
-        Ok(runtime.block_on(future))
+        }),
+        Err(_) => Ok(runtime.block_on(future)),
     }
 }
 
@@ -214,7 +216,8 @@ mod tests {
 
     #[test]
     fn macroscope_request_is_safe_inside_tokio_runtime() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
             .enable_all()
             .build()
             .unwrap();
@@ -222,6 +225,25 @@ mod tests {
             assert_eq!(
                 response(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc", 3).unwrap(),
                 b"abc"
+            );
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let client = Client::new().unwrap();
+            let error = client
+                .read(
+                    client.get("http://127.0.0.1:1"),
+                    1,
+                    &AtomicBool::new(false),
+                    Instant::now() + Duration::from_secs(1),
+                )
+                .unwrap_err();
+            assert_eq!(
+                error,
+                "Synchronous video loading cannot run inside a single-thread Tokio runtime"
             );
         });
     }

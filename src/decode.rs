@@ -208,6 +208,7 @@ struct FragmentSegment {
     range: Range<u64>,
     start: u64,
     duration: u64,
+    starts_with_sap: bool,
 }
 
 struct FragmentPlan {
@@ -542,15 +543,7 @@ impl<R: Read + Seek> FragmentVideo<R> {
     fn seek(&mut self, seconds: f64) -> Result<(), String> {
         if !self.segments.is_empty() {
             let target = seconds.max(0.) * self.segment_scale + self.segment_origin;
-            let segment = self
-                .segments
-                .iter()
-                .enumerate()
-                .filter(|(_, segment)| segment.start as f64 <= target)
-                .map(|(index, _)| index)
-                .next_back()
-                .unwrap_or(0)
-                .saturating_sub(1);
+            let segment = indexed_seek_segment(&self.segments, target);
             self.load_segment(segment)?;
         }
         let target = (seconds.max(0.) + self.offset) * self.scale;
@@ -613,6 +606,20 @@ impl<R: Read + Seek> FragmentVideo<R> {
             Some(self.pending.remove(0))
         })
     }
+}
+
+fn indexed_seek_segment(segments: &[FragmentSegment], target: f64) -> usize {
+    let target = segments
+        .iter()
+        .enumerate()
+        .filter(|(_, segment)| segment.start as f64 <= target)
+        .map(|(index, _)| index)
+        .next_back()
+        .unwrap_or(0);
+    (0..=target.saturating_sub(1))
+        .rev()
+        .find(|index| segments[*index].starts_with_sap)
+        .unwrap_or(0)
 }
 
 pub enum MediaVideo<R> {
@@ -803,7 +810,7 @@ fn fragment_plan<R: Read + Seek>(
         for _ in 0..count {
             let reference = read_u32(reader)?;
             let duration = read_u32(reader)?;
-            let _sap = read_u32(reader)?;
+            let sap = read_u32(reader)?;
             let length = u64::from(reference & 0x7fff_ffff);
             let segment_end = position
                 .checked_add(length)
@@ -816,6 +823,7 @@ fn fragment_plan<R: Read + Seek>(
                 range: position..segment_end,
                 start: time,
                 duration: u64::from(duration),
+                starts_with_sap: sap & 0x8000_0000 != 0,
             });
             position = segment_end;
             time = time
@@ -1102,5 +1110,25 @@ mod tests {
             ensure_fragment_sample_limit(900_001, 100_000).unwrap_err(),
             "Video exceeds the sample limit"
         );
+    }
+
+    #[test]
+    fn macroscope_indexed_seek_uses_sap_boundaries() {
+        let segment = |start, starts_with_sap| FragmentSegment {
+            range: start..start + 1,
+            start,
+            duration: 1,
+            starts_with_sap,
+        };
+        let segments = [
+            segment(0, true),
+            segment(1, false),
+            segment(2, false),
+            segment(3, true),
+            segment(4, false),
+        ];
+        assert_eq!(indexed_seek_segment(&segments, 2.), 0);
+        assert_eq!(indexed_seek_segment(&segments, 3.), 0);
+        assert_eq!(indexed_seek_segment(&segments, 4.), 3);
     }
 }

@@ -90,7 +90,7 @@ fn indexed_fixture_with_origin(origin: u32) -> (Arc<[u8]>, usize) {
         offset += size;
     }
     assert_eq!(ranges.len(), parsed.moofs.len());
-    let durations: Vec<u32> = parsed
+    let fragments: Vec<(u32, bool)> = parsed
         .moofs
         .iter()
         .map(|moof| {
@@ -100,7 +100,7 @@ fn indexed_fixture_with_origin(origin: u32) -> (Arc<[u8]>, usize) {
                 .find(|traf| traf.tfhd.track_id == track_id)
                 .unwrap();
             let run = traf.trun.as_ref().unwrap();
-            (0..run.sample_count as usize)
+            let duration = (0..run.sample_count as usize)
                 .map(|index| {
                     run.sample_durations
                         .get(index)
@@ -109,7 +109,16 @@ fn indexed_fixture_with_origin(origin: u32) -> (Arc<[u8]>, usize) {
                         .or_else(|| trex.map(|trex| trex.default_sample_duration))
                         .unwrap()
                 })
-                .sum()
+                .sum();
+            let flags = run
+                .sample_flags
+                .first()
+                .copied()
+                .or(run.first_sample_flags)
+                .or(traf.tfhd.default_sample_flags)
+                .or_else(|| trex.map(|trex| trex.default_sample_flags))
+                .unwrap_or(0);
+            (duration, flags & 0x10000 == 0)
         })
         .collect();
     let index_size = 32 + ranges.len() * 12;
@@ -123,10 +132,11 @@ fn indexed_fixture_with_origin(origin: u32) -> (Arc<[u8]>, usize) {
     sidx.extend_from_slice(&0u32.to_be_bytes());
     sidx.extend_from_slice(&0u16.to_be_bytes());
     sidx.extend_from_slice(&(ranges.len() as u16).to_be_bytes());
-    for (range, duration) in ranges.iter().zip(durations) {
+    for (range, (duration, starts_with_sap)) in ranges.iter().zip(fragments) {
         sidx.extend_from_slice(&((range.end - range.start) as u32).to_be_bytes());
         sidx.extend_from_slice(&duration.to_be_bytes());
-        sidx.extend_from_slice(&0x9000_0000u32.to_be_bytes());
+        let sap = if starts_with_sap { 0x9000_0000u32 } else { 0 };
+        sidx.extend_from_slice(&sap.to_be_bytes());
     }
     let start = ranges[0].start;
     let first_end = start + sidx.len() + ranges[0].len();

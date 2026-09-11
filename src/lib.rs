@@ -5,7 +5,7 @@
 //! previous image when a snapshot has no new pixels. Position and duration are
 //! measured in seconds, and buffered progress is a fraction from zero to one.
 //! Dropping the player requests cancellation; it does not synchronously join
-//! ongoing network work. Direct range requests may finish at their timeout.
+//! ongoing network work. Direct range requests cancel their active response.
 //!
 //! The default build has no windowing dependency. Enable `native` to build the
 //! optional Slint player. The API is experimental and may change before 1.0.
