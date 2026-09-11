@@ -2,7 +2,114 @@ use rust_media::{
     decode::{MediaVideo, Video},
     fragment::remux,
 };
-use std::io::Cursor;
+use std::{
+    io::{self, Cursor, Read, Seek, SeekFrom},
+    sync::Arc,
+};
+
+struct LimitedCursor {
+    cursor: Cursor<Arc<[u8]>>,
+    limit: u64,
+}
+
+impl LimitedCursor {
+    fn new(bytes: Arc<[u8]>, limit: usize) -> Self {
+        Self {
+            cursor: Cursor::new(bytes),
+            limit: limit as u64,
+        }
+    }
+}
+
+impl Read for LimitedCursor {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let position = self.cursor.position();
+        if position >= self.limit {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        let available = (self.limit - position) as usize;
+        let length = output.len().min(available);
+        self.cursor.read(&mut output[..length])
+    }
+}
+
+impl Seek for LimitedCursor {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.cursor.seek(position)
+    }
+}
+
+fn indexed_fixture() -> (Arc<[u8]>, usize) {
+    let source = include_bytes!("fixtures/fragmented.mp4");
+    let parsed = mp4::Mp4Reader::read_header(Cursor::new(source), source.len() as u64).unwrap();
+    let track = parsed.tracks().values().next().unwrap();
+    let track_id = track.track_id();
+    let trex = parsed
+        .moov
+        .mvex
+        .as_ref()
+        .map(|mvex| &mvex.trex)
+        .filter(|trex| trex.track_id == track_id);
+    let mut offset = 0usize;
+    let mut ranges = Vec::new();
+    let mut fragment_start = None;
+    while offset < source.len() {
+        let size = u32::from_be_bytes(source[offset..offset + 4].try_into().unwrap()) as usize;
+        let kind = &source[offset + 4..offset + 8];
+        if kind == b"moof" {
+            fragment_start = Some(offset);
+        } else if kind == b"mdat" {
+            ranges.push(fragment_start.take().unwrap()..offset + size);
+        }
+        offset += size;
+    }
+    assert_eq!(ranges.len(), parsed.moofs.len());
+    let durations: Vec<u32> = parsed
+        .moofs
+        .iter()
+        .map(|moof| {
+            let traf = moof
+                .trafs
+                .iter()
+                .find(|traf| traf.tfhd.track_id == track_id)
+                .unwrap();
+            let run = traf.trun.as_ref().unwrap();
+            (0..run.sample_count as usize)
+                .map(|index| {
+                    run.sample_durations
+                        .get(index)
+                        .copied()
+                        .or(traf.tfhd.default_sample_duration)
+                        .or_else(|| trex.map(|trex| trex.default_sample_duration))
+                        .unwrap()
+                })
+                .sum()
+        })
+        .collect();
+    let index_size = 32 + ranges.len() * 12;
+    let mut sidx = Vec::with_capacity(index_size);
+    sidx.extend_from_slice(&(index_size as u32).to_be_bytes());
+    sidx.extend_from_slice(b"sidx");
+    sidx.extend_from_slice(&[0; 4]);
+    sidx.extend_from_slice(&track_id.to_be_bytes());
+    sidx.extend_from_slice(&track.timescale().to_be_bytes());
+    sidx.extend_from_slice(&0u32.to_be_bytes());
+    sidx.extend_from_slice(&0u32.to_be_bytes());
+    sidx.extend_from_slice(&0u16.to_be_bytes());
+    sidx.extend_from_slice(&(ranges.len() as u16).to_be_bytes());
+    for (range, duration) in ranges.iter().zip(durations) {
+        sidx.extend_from_slice(&((range.end - range.start) as u32).to_be_bytes());
+        sidx.extend_from_slice(&duration.to_be_bytes());
+        sidx.extend_from_slice(&0x9000_0000u32.to_be_bytes());
+    }
+    let start = ranges[0].start;
+    let first_end = start + sidx.len() + ranges[0].len();
+    let mut bytes = Vec::with_capacity(source.len() + sidx.len());
+    bytes.extend_from_slice(&source[..start]);
+    bytes.extend_from_slice(&sidx);
+    bytes.extend_from_slice(&source[start..]);
+    (bytes.into(), first_end)
+}
 
 #[test]
 fn fragment_offsets_preserve_every_decoded_frame() {
@@ -48,6 +155,52 @@ fn fragmented_video_seek_matches_linear_decode() {
         )
         .unwrap()
     };
+    let target = 1.;
+    let mut linear = open();
+    let expected = loop {
+        let frame = linear.frame().unwrap().unwrap();
+        if frame.0 >= target {
+            break frame;
+        }
+    };
+    let mut seeked = open();
+    seeked.seek(target).unwrap();
+    let actual = loop {
+        let frame = seeked.frame().unwrap().unwrap();
+        if frame.0 >= target {
+            break frame;
+        }
+    };
+    assert_eq!(expected.0, actual.0);
+    assert_eq!(expected.1.rgba, actual.1.rgba);
+}
+
+#[test]
+fn indexed_fragments_start_without_later_segments_and_seek() {
+    let (bytes, first_end) = indexed_fixture();
+    let mut startup = MediaVideo::fragmented(
+        LimitedCursor::new(bytes.clone(), first_end),
+        LimitedCursor::new(bytes.clone(), bytes.len()),
+        bytes.len() as u64,
+    )
+    .unwrap();
+    assert!(startup.frame().unwrap().is_some());
+
+    let open = || {
+        MediaVideo::fragmented(
+            Cursor::new(bytes.clone()),
+            Cursor::new(bytes.clone()),
+            bytes.len() as u64,
+        )
+        .unwrap()
+    };
+    let mut complete = open();
+    let mut count = 0;
+    while complete.frame().unwrap().is_some() {
+        count += 1;
+    }
+    assert_eq!(count, 48);
+
     let target = 1.;
     let mut linear = open();
     let expected = loop {

@@ -167,6 +167,43 @@ impl RemoteFile {
         } else {
             self.size - 1
         });
+        let mut failure = None;
+        for attempt in 0..3 {
+            match self.request_block(start, end) {
+                Ok((actual_start, size, bytes)) => {
+                    if size == 0 || size > MAX_SIZE || (self.size != 0 && self.size != size) {
+                        return Err(io::ErrorKind::InvalidData.into());
+                    }
+                    let bytes: Arc<[u8]> = bytes.into();
+                    if let Some(cache) = &self.cache {
+                        cache.store(actual_start, bytes.clone(), size);
+                    }
+                    self.size = size;
+                    self.start = actual_start;
+                    self.bytes = bytes;
+                    return Ok(());
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::Other
+                            | io::ErrorKind::UnexpectedEof
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::ConnectionAborted
+                            | io::ErrorKind::ConnectionReset
+                            | io::ErrorKind::BrokenPipe
+                    ) =>
+                {
+                    failure = Some(error);
+                    std::thread::sleep(Duration::from_millis(50 * (attempt + 1)));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(failure.unwrap_or_else(|| io::Error::other("Video range request failed")))
+    }
+
+    fn request_block(&self, start: u64, end: u64) -> io::Result<(u64, u64, Vec<u8>)> {
         let mut url = self.url.clone();
         for _ in 0..5 {
             if !allowed(&url) {
@@ -193,7 +230,15 @@ impl RemoteFile {
                 continue;
             }
             let partial = response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
-            let response = response.error_for_status().map_err(io::Error::other)?;
+            if !response.status().is_success() {
+                let status = response.status();
+                let kind = if status.is_server_error() {
+                    io::ErrorKind::Other
+                } else {
+                    io::ErrorKind::PermissionDenied
+                };
+                return Err(io::Error::new(kind, format!("HTTP {status}")));
+            }
             let (actual_start, size, limit) = if partial {
                 let range = response
                     .headers()
@@ -221,22 +266,12 @@ impl RemoteFile {
                 }
                 (0, size, size)
             };
-            if size == 0 || size > MAX_SIZE || (self.size != 0 && self.size != size) {
-                return Err(io::ErrorKind::InvalidData.into());
-            }
             let mut bytes = Vec::new();
             response.take(limit + 1).read_to_end(&mut bytes)?;
             if bytes.len() as u64 != limit || self.cancel.load(Ordering::Relaxed) {
                 return Err(io::ErrorKind::UnexpectedEof.into());
             }
-            let bytes: Arc<[u8]> = bytes.into();
-            if let Some(cache) = &self.cache {
-                cache.store(actual_start, bytes.clone(), size);
-            }
-            self.size = size;
-            self.start = actual_start;
-            self.bytes = bytes;
-            return Ok(());
+            return Ok((actual_start, size, bytes));
         }
         Err(io::Error::other("Too many video redirects"))
     }
