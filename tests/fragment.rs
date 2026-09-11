@@ -225,6 +225,45 @@ fn duplicate_first_trun(bytes: &[u8]) -> Vec<u8> {
     output
 }
 
+fn extend_mdat_headers(bytes: &[u8]) -> Vec<u8> {
+    let mut source = bytes.to_vec();
+    let mut offset = 0usize;
+    while offset < source.len() {
+        let size = u32::from_be_bytes(source[offset..offset + 4].try_into().unwrap()) as usize;
+        if &source[offset + 4..offset + 8] == b"moof" {
+            let trun = offset
+                + source[offset..offset + size]
+                    .windows(4)
+                    .position(|value| value == b"trun")
+                    .unwrap();
+            let flags =
+                u32::from_be_bytes([0, source[trun + 5], source[trun + 6], source[trun + 7]]);
+            assert_ne!(flags & 1, 0);
+            let data_offset = trun + 12;
+            let value =
+                i32::from_be_bytes(source[data_offset..data_offset + 4].try_into().unwrap());
+            source[data_offset..data_offset + 4].copy_from_slice(&(value + 8).to_be_bytes());
+        }
+        offset += size;
+    }
+    let mut output = Vec::with_capacity(source.len() + 64);
+    offset = 0;
+    while offset < source.len() {
+        let size = u32::from_be_bytes(source[offset..offset + 4].try_into().unwrap()) as usize;
+        let end = offset + size;
+        if &source[offset + 4..offset + 8] == b"mdat" {
+            output.extend_from_slice(&1u32.to_be_bytes());
+            output.extend_from_slice(b"mdat");
+            output.extend_from_slice(&((size + 8) as u64).to_be_bytes());
+            output.extend_from_slice(&source[offset + 8..end]);
+        } else {
+            output.extend_from_slice(&source[offset..end]);
+        }
+        offset = end;
+    }
+    output
+}
+
 #[test]
 fn fragment_offsets_preserve_every_decoded_frame() {
     let fragmented = include_bytes!("fixtures/fragmented.mp4");
@@ -500,6 +539,22 @@ fn macroscope_remux_normalizes_nonzero_fragment_origin() {
     shift_fragment_times(&mut shifted, 90_000);
     let expected = remux(source, &Default::default()).unwrap();
     let actual = remux(&shifted, &Default::default()).unwrap();
+    let mut expected = Video::new(Cursor::new(&expected), expected.len() as u64).unwrap();
+    let mut actual = Video::new(Cursor::new(&actual), actual.len() as u64).unwrap();
+    while let Some(frame) = expected.frame().unwrap() {
+        let result = actual.frame().unwrap().unwrap();
+        assert_eq!(result.0, frame.0);
+        assert_eq!(result.1.rgba, frame.1.rgba);
+    }
+    assert!(actual.frame().unwrap().is_none());
+}
+
+#[test]
+fn macroscope_remux_accepts_extended_mdat() {
+    let source = include_bytes!("fixtures/fragmented.mp4");
+    let extended = extend_mdat_headers(source);
+    let expected = remux(source, &Default::default()).unwrap();
+    let actual = remux(&extended, &Default::default()).unwrap();
     let mut expected = Video::new(Cursor::new(&expected), expected.len() as u64).unwrap();
     let mut actual = Video::new(Cursor::new(&actual), actual.len() as u64).unwrap();
     while let Some(frame) = expected.frame().unwrap() {

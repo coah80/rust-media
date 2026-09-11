@@ -21,21 +21,32 @@ fn remux_inner(data: &[u8], cancel: &AtomicBool) -> Result<Vec<u8>, Box<dyn std:
             return Err("too many top-level boxes".into());
         }
         let header = data.get(offset..offset + 8).ok_or("short box")?;
-        let size = u32::from_be_bytes(header[..4].try_into()?) as usize;
-        if size < 8 || size > data.len() - offset {
+        let short_size = u32::from_be_bytes(header[..4].try_into()?);
+        let (size, header_size) = if short_size == 1 {
+            let extended = data.get(offset + 8..offset + 16).ok_or("short box")?;
+            (
+                usize::try_from(u64::from_be_bytes(extended.try_into()?))?,
+                16,
+            )
+        } else if short_size == 0 {
+            (data.len() - offset, 8)
+        } else {
+            (short_size as usize, 8)
+        };
+        if size < header_size || size > data.len() - offset {
             return Err("invalid box".into());
         }
         if &header[4..8] == b"moof" {
             let mut reader = Cursor::new(data);
             crate::decode::validate_fragment_runs(
                 &mut reader,
-                (offset + 8) as u64,
+                (offset + header_size) as u64,
                 (offset + size) as u64,
             )?;
             moofs.push(offset);
         }
         if &header[4..8] == b"mdat" {
-            mdats.push(offset + 8..offset + size);
+            mdats.push(offset + header_size..offset + size);
         }
         offset += size;
     }
