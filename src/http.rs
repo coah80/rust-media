@@ -3,13 +3,42 @@ use std::{
     io::{self, Read, Seek, SeekFrom},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
 const BLOCK: u64 = 512 * 1024;
 const MAX_SIZE: u64 = 2 * 1024 * 1024 * 1024;
+const MAX_BODY_READERS: usize = 2;
+static BODY_READERS: AtomicUsize = AtomicUsize::new(0);
+
+struct BodyReaderPermit;
+
+impl BodyReaderPermit {
+    fn acquire(cancel: &AtomicBool) -> io::Result<Self> {
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            if BODY_READERS
+                .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |active| {
+                    (active < MAX_BODY_READERS).then_some(active + 1)
+                })
+                .is_ok()
+            {
+                return Ok(Self);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for BodyReaderPermit {
+    fn drop(&mut self) {
+        BODY_READERS.fetch_sub(1, Ordering::Release);
+    }
+}
 
 #[derive(Default)]
 struct Cache {
@@ -276,12 +305,17 @@ fn read_body(
     limit: u64,
     cancel: &AtomicBool,
 ) -> io::Result<Vec<u8>> {
+    let permit = BodyReaderPermit::acquire(cancel)?;
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let result = response.take(limit).read_to_end(&mut bytes).map(|_| bytes);
-        let _ = sender.send(result);
-    });
+    std::thread::Builder::new()
+        .name("rust-media-body".into())
+        .spawn(move || {
+            let _permit = permit;
+            let mut bytes = Vec::new();
+            let result = response.take(limit).read_to_end(&mut bytes).map(|_| bytes);
+            let _ = sender.send(result);
+        })
+        .map_err(io::Error::other)?;
     loop {
         if cancel.load(Ordering::Relaxed) {
             return Err(io::ErrorKind::Interrupted.into());
@@ -514,5 +548,92 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         assert!(began.elapsed() < Duration::from_millis(500));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn macroscope_cancelled_body_reads_are_bounded() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            sync::{Arc, Barrier, mpsc},
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let barrier = Arc::new(Barrier::new(4));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (held_tx, held_rx) = mpsc::channel();
+        let server_barrier = barrier.clone();
+        let server = std::thread::spawn(move || {
+            let mut handlers = Vec::new();
+            for _ in 0..3 {
+                let (mut socket, _) = listener.accept().unwrap();
+                let started_tx = started_tx.clone();
+                let held_tx = held_tx.clone();
+                let barrier = server_barrier.clone();
+                handlers.push(std::thread::spawn(move || {
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        let mut byte = [0];
+                        socket.read_exact(&mut byte).unwrap();
+                        request.push(byte[0]);
+                    }
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nContent-Range: bytes 0-3/4\r\n\r\nx",
+                        )
+                        .unwrap();
+                    started_tx.send(()).unwrap();
+                    barrier.wait();
+                    socket
+                        .set_read_timeout(Some(Duration::from_millis(200)))
+                        .unwrap();
+                    let mut byte = [0];
+                    let held = socket.read(&mut byte).is_err_and(|error| {
+                        matches!(
+                            error.kind(),
+                            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                        )
+                    });
+                    held_tx.send(held).unwrap();
+                }));
+            }
+            for handler in handlers {
+                handler.join().unwrap();
+            }
+        });
+        let file = RemoteFile {
+            client: reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(15))
+                .build()
+                .unwrap(),
+            url: url.clone(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            position: 0,
+            size: 0,
+            start: 0,
+            bytes: Arc::from([]),
+            cache: None,
+            max_size: 4,
+        };
+        for _ in 0..3 {
+            let cancel = Arc::new(AtomicBool::new(false));
+            let mut worker_file = file.clone();
+            worker_file.cancel = cancel.clone();
+            let worker_url = url.clone();
+            let worker =
+                std::thread::spawn(move || worker_file.request_block_from(&worker_url, 0, 3, true));
+            started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            cancel.store(true, Ordering::Relaxed);
+            assert_eq!(
+                worker.join().unwrap().unwrap_err().kind(),
+                io::ErrorKind::Interrupted
+            );
+        }
+        barrier.wait();
+        let held = (0..3)
+            .filter(|_| held_rx.recv_timeout(Duration::from_secs(1)).unwrap())
+            .count();
+        server.join().unwrap();
+        assert!(held <= 2, "{held} cancelled body readers remained active");
     }
 }

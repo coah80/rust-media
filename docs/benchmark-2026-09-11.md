@@ -4,9 +4,9 @@ Release builds on Windows x64, AMD Ryzen 7 9800X3D. Measurements use Windows pro
 
 ## Production-readiness rerun
 
-The final review run added 23 focused regressions covering all 22 posted Macroscope findings. They cover parser and cache limits, aggregate fragment limits, extended box sizes, track defaults, multiple-run rejection, nonzero fragment timelines, edit lists, sparse-frame probing, split UMP parts, bounded context policies, reserved framing bytes, cancellation during stalled bodies and retries, duration enforcement, provider error selection and Tokio runtime reentry.
+The final review run added 24 focused regressions covering all 23 posted Macroscope findings. They cover parser and cache limits, aggregate fragment limits, extended box sizes, track defaults, multiple-run rejection, nonzero fragment timelines, edit lists, sparse-frame probing, split UMP parts, bounded context policies, reserved framing bytes, bounded response readers, cancellation during stalled bodies, remuxing and retries, duration enforcement, provider error selection and Tokio runtime reentry.
 
-The full suite passed 56 checks with native features. A separate stress test passed 100 fresh decoder open/seek cycles, 20 repeated complete ordinary decodes and 25 repeated complete fragmented decodes with exact presentation timestamps and RGBA checksums. This run found and fixed a B-frame seek boundary that the smaller seek test missed.
+The full suite passed 57 checks with native features. A separate stress test passed 100 fresh decoder open/seek cycles, 20 repeated complete ordinary decodes and 25 repeated complete fragmented decodes with exact presentation timestamps and RGBA checksums. This run found and fixed a B-frame seek boundary that the smaller seek test missed.
 
 Twelve fresh-process YouTube startup probes covered the same four videos three times each. Every video retained its checksum. First-frame time ranged from 1.000 to 1.780 seconds. A current complete Sintel run decoded 21,313 frames and 78,329,856 AAC samples through 888.000 seconds in 192.293 seconds. Its checksum remained `4f336c142cea91b5`, resident memory stayed roughly 140-153 MiB during the run and peaked at 163.4 MiB. A current complete `Gf-fCJ6TkRU` run decoded 4,159 frames and 15,290,368 AAC samples through 173.250 seconds in 46.298 seconds with checksum `bec25ce2bd6e2572`; peak resident/private memory was 110.5/99.6 MiB.
 
@@ -63,7 +63,7 @@ All four probes decoded the entire video and AAC stream, reached the final times
 
 Run a complete probe with `cargo run --release --locked --features native -- --probe-all https://www.youtube.com/watch?v=VIDEO_ID`. Use `--probe` for startup plus up to 60 frames. Probes do not present frames in real time or play sound.
 
-After removing the temporary UI driver, the final release executable was rebuilt and all four startup probes passed again in sequence. First-frame times were 1.594 / 1.396 / 1.305 / 1.346 seconds in the table's video order; their 60-frame checksums matched the earlier runs. The local 90-frame 720p probe also retained checksum `aa7c17764dfb791d`. Final executable SHA-256: `e2f529d7e0be106d511f76ab104aa9f48693858440bae76bc4f6cb376e7eb39b`.
+After removing the temporary UI driver, the final release executable was rebuilt and all four startup probes passed again in sequence. First-frame times were 1.594 / 1.396 / 1.305 / 1.346 seconds in the table's video order; their 60-frame checksums matched the earlier runs. The local 90-frame 720p probe also retained checksum `aa7c17764dfb791d`. Final executable SHA-256: `75392f2fef451abe471b432f597cac52d98b34de85e1ddaa88b2d93eae07e368`.
 
 ## Remaining coverage limits
 

@@ -137,6 +137,9 @@ fn remux_inner(data: &[u8], cancel: &AtomicBool) -> Result<Vec<u8>, Box<dyn std:
             .checked_add_signed(i64::from(run.data_offset.ok_or("missing data offset")?))
             .ok_or("invalid offset")? as usize;
         for index in 0..run.sample_count as usize {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("assembly cancelled".into());
+            }
             sample_count += 1;
             if sample_count > 1_000_000 {
                 return Err("too many samples".into());
