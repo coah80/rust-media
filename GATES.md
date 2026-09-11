@@ -14,7 +14,7 @@ Scope: native YouTube video/audio playback and controls, with broader provider v
   CHECK: cargo test --locked && cargo clippy --locked --all-targets -- -D warnings && echo YOUTUBE_CHECKS_OK
   EXPECT: YOUTUBE_CHECKS_OK
   EVIDENCE: automatic-evidence=v1; definition-sha256=578d9cc43ef5ec061bbf25c43b2ef110d524950cb4772d5c5eb69f9ca1eeebd1; exit=0; EXPECT=matched; output-sha256=af9988ad10c5050e83853addae3ba066338691ea3b6cdddf696f89d8611223a7; output-bytes=2726; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\cole\projects\rust-media; path=aee1c3638993/51 entries
-- [ ] Y5: reviewed implementation and exact release build are published for review
-  EVIDENCE: Pending final build, source publication and PR update.
+- [x] Y5: reviewed source is published and the exact Windows release build is verified
+  EVIDENCE: Draft PR https://github.com/coah80/rust-media/pull/1 contains source commit 66c4265439d4b8be789270b1295d308f37570b95 and measured limits. Local target/release/rust-media.exe SHA256 is 6c02bea0516b414178a1eacf6ed2af73d1b3f4b08893afe1015688cf2ef3f43a. Final release rebuild and live YouTube probe passed in 4.416 seconds; UI-free library check passed. The binary is local, not a GitHub release asset.
 - [ ] Y6: longer YouTube video plays completely through client verification
   EVIDENCE: Unmet. aqz-KE-bpKQ delivered 62.2 seconds of video and 69.9 seconds of audio, then protection status 3 stopped delivery. The implemented transport now fails immediately on that status. Inspected verification integration uses Deno/V8 and was not added under the Rust-only constraint. This gate is not covered by the successful short clip.
