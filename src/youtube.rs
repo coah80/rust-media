@@ -54,7 +54,7 @@ impl Track {
         !self.init.is_empty()
             && self
                 .final_segment
-                .is_some_and(|end| i64::from(self.last) >= end)
+                .is_some_and(|end| i64::from(self.last) == end)
     }
     fn range(&self) -> Option<p::Range> {
         (self.last > 0).then(|| p::Range {
@@ -77,6 +77,12 @@ impl Track {
             if sequence <= 0 || sequence > 100_000 {
                 return Err("Invalid YouTube segment sequence".into());
             }
+            if self
+                .final_segment
+                .is_some_and(|end| i64::from(sequence) > end)
+            {
+                return Err("YouTube returned media after the declared end".into());
+            }
             if let std::collections::btree_map::Entry::Vacant(entry) = self.segments.entry(sequence)
             {
                 let (start, duration) = segment_time(header)?;
@@ -96,8 +102,19 @@ impl Track {
         Ok(())
     }
     fn finish(self, cancel: &AtomicBool, remux: bool) -> Result<Arc<[u8]>, String> {
+        if !self.complete()
+            || self.segments.last_key_value().is_some_and(|(sequence, _)| {
+                self.final_segment
+                    .is_some_and(|end| i64::from(*sequence) > end)
+            })
+        {
+            return Err("YouTube returned an inconsistent segment count".into());
+        }
         let mut bytes = self.init;
         for (_, _, segment) in self.segments.into_values() {
+            if cancel.load(Ordering::Relaxed) {
+                return Err("Video loading cancelled".into());
+            }
             bytes.extend(segment);
         }
         if remux {
@@ -165,13 +182,7 @@ pub(crate) fn prepare(
             .ok_or("Missing YouTube stream URL")?,
     )
     .map_err(|_| "Invalid YouTube stream URL")?;
-    let client = reqwest::blocking::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(8))
-        .timeout(Duration::from_secs(20))
-        .user_agent("rust-media/0.1")
-        .build()
-        .map_err(|_| "Could not start the YouTube transport")?;
+    let client = crate::request::Client::new()?;
     if let Some(input) = url
         .query_pairs()
         .find(|(key, _)| key == "n")
@@ -193,14 +204,12 @@ pub(crate) fn prepare(
         {
             return Err("Invalid YouTube player script path".into());
         }
-        let response = client
-            .get(format!("https://www.youtube.com{asset}"))
-            .send()
-            .map_err(|_| "Could not load the YouTube player script")?;
-        if !response.status().is_success() {
-            return Err("YouTube refused its player script".into());
-        }
-        let code = read_bounded(response, 8 * 1024 * 1024, &cancel)?;
+        let code = client.read(
+            client.get(&format!("https://www.youtube.com{asset}")),
+            8 * 1024 * 1024,
+            &cancel,
+            Instant::now() + Duration::from_secs(20),
+        )?;
         let code = String::from_utf8(code).map_err(|_| "Invalid YouTube player script")?;
         let output = crate::script::transform(code, input, cancel.clone())?;
         let pairs: Vec<_> = url
@@ -263,21 +272,14 @@ pub(crate) fn prepare(
         request_url
             .query_pairs_mut()
             .append_pair("rn", &request_number.to_string());
-        let response = client
+        let request = client
             .post(request_url)
             .header("Content-Type", "application/x-protobuf")
             .header("Accept", "application/vnd.yt-ump")
-            .body(request.encode_to_vec())
-            .send()
-            .map_err(|_| "YouTube streaming was interrupted")?;
-        if !response.status().is_success() {
-            return Err(format!(
-                "YouTube refused the stream, HTTP {}",
-                response.status().as_u16()
-            ));
-        }
+            .body(request.encode_to_vec());
+        let body = client.read(request, 32 * 1024 * 1024, &cancel, deadline)?;
         let before = total;
-        let mut response = response.take(32 * 1024 * 1024);
+        let mut response = body.as_slice();
         let mut headers = HashMap::<u32, (p::Header, Vec<u8>)>::new();
         let mut backoff = 0;
         while let Some((kind, data)) =
@@ -359,17 +361,7 @@ pub(crate) fn prepare(
                 44 => return Err("YouTube returned a streaming error".into()),
                 57 => {
                     let update = decode::<p::ContextUpdate>(&data)?;
-                    let kind = update.kind.ok_or("Missing streaming context type")?;
-                    let value = update.value.unwrap_or_default();
-                    if contexts.len() >= 32 || value.len() > 64 * 1024 {
-                        return Err("YouTube streaming context exceeds the limit".into());
-                    }
-                    if update.write_policy != Some(2) || !contexts.contains_key(&kind) {
-                        contexts.insert(kind, value);
-                    }
-                    if update.send == Some(true) {
-                        send_contexts.insert(kind);
-                    }
+                    update_context(&mut contexts, &mut send_contexts, update)?;
                 }
                 59 => {
                     let policy = decode::<p::ContextPolicy>(&data)?;
@@ -434,6 +426,24 @@ fn segment_time(header: &p::Header) -> Result<(i64, i64), String> {
         .ok_or("Missing media duration")?;
     Ok((start, duration))
 }
+fn update_context(
+    contexts: &mut BTreeMap<i32, Vec<u8>>,
+    send_contexts: &mut HashSet<i32>,
+    update: p::ContextUpdate,
+) -> Result<(), String> {
+    let kind = update.kind.ok_or("Missing streaming context type")?;
+    let value = update.value.unwrap_or_default();
+    if (!contexts.contains_key(&kind) && contexts.len() >= 32) || value.len() > 64 * 1024 {
+        return Err("YouTube streaming context exceeds the limit".into());
+    }
+    if update.write_policy != Some(2) || !contexts.contains_key(&kind) {
+        contexts.insert(kind, value);
+    }
+    if update.send == Some(true) {
+        send_contexts.insert(kind);
+    }
+    Ok(())
+}
 fn check(cancel: &AtomicBool, deadline: Instant) -> Result<(), String> {
     if cancel.load(Ordering::Relaxed) {
         Err("Video loading cancelled".into())
@@ -452,25 +462,6 @@ fn json_after(text: &str, marker: &str) -> Option<Value> {
 }
 fn decode<T: Message + Default>(data: &[u8]) -> Result<T, String> {
     T::decode(data).map_err(|_| "Invalid YouTube streaming metadata".into())
-}
-fn read_bounded(mut input: impl Read, max: usize, cancel: &AtomicBool) -> Result<Vec<u8>, String> {
-    let mut output = Vec::new();
-    let mut block = [0; 8192];
-    loop {
-        if cancel.load(Ordering::Relaxed) {
-            return Err("Video loading cancelled".into());
-        }
-        let count = input
-            .read(&mut block)
-            .map_err(|_| "YouTube response was interrupted")?;
-        if count == 0 {
-            return Ok(output);
-        }
-        if output.len() + count > max {
-            return Err("YouTube response exceeds the size limit".into());
-        }
-        output.extend_from_slice(&block[..count]);
-    }
 }
 fn read_uint(input: &mut impl Read) -> io::Result<Option<u32>> {
     let mut first = [0u8];
@@ -517,6 +508,36 @@ fn read_part(input: &mut impl Read) -> io::Result<Option<(u32, Vec<u8>)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn full_context_table_accepts_refresh_without_growing() {
+        let mut contexts: BTreeMap<_, _> = (0..32).map(|kind| (kind, vec![1])).collect();
+        let mut send = HashSet::new();
+        let update = |kind, policy| p::ContextUpdate {
+            kind: Some(kind),
+            value: Some(vec![2]),
+            send: Some(true),
+            write_policy: Some(policy),
+        };
+        update_context(&mut contexts, &mut send, update(0, 1)).unwrap();
+        assert_eq!(contexts[&0], [2]);
+        update_context(&mut contexts, &mut send, update(1, 2)).unwrap();
+        assert_eq!(contexts[&1], [1]);
+        assert_eq!(contexts.len(), 32);
+        assert!(update_context(&mut contexts, &mut send, update(32, 1)).is_err());
+        assert!(!send.contains(&32));
+    }
+
+    #[test]
+    fn finished_track_rejects_media_after_declared_end() {
+        let mut track = Track::new(&serde_json::json!({"itag":140,"lastModified":"1"})).unwrap();
+        track.init = vec![0];
+        track.final_segment = Some(1);
+        track.last = 2;
+        track.segments.insert(1, (0, 1000, vec![1]));
+        track.segments.insert(2, (1000, 1000, vec![2]));
+        assert!(track.finish(&AtomicBool::new(false), false).is_err());
+    }
+
     #[test]
     fn out_of_order_segments_become_contiguous_and_gaps_fail() {
         let mut track = Track::new(&serde_json::json!({"itag":140,"lastModified":"1"})).unwrap();

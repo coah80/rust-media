@@ -1,6 +1,6 @@
 use serde_json::Value;
 use std::sync::{Arc, atomic::AtomicBool};
-use std::{io::Read, time::Duration};
+use std::time::{Duration, Instant};
 
 pub struct Prepared {
     pub video: Arc<[u8]>,
@@ -60,7 +60,7 @@ pub fn resolve_with_cancel(input: &str, cancel: Arc<AtomicBool>) -> Result<Resol
             cancel,
         ),
         "fixupx.com" | "www.fixupx.com" | "fxtwitter.com" | "www.fxtwitter.com" | "x.com"
-        | "twitter.com" => fixtweet(&status_id(&url).ok_or("Invalid post link")?),
+        | "twitter.com" => fixtweet(&status_id(&url).ok_or("Invalid post link")?, &cancel),
         _ if crate::http::allowed(input) => Ok(Resolved {
             video: input.into(),
             audio: None,
@@ -72,33 +72,14 @@ pub fn resolve_with_cancel(input: &str, cancel: Arc<AtomicBool>) -> Result<Resol
     }
 }
 
-fn fetch(url: &str) -> Result<Vec<u8>, String> {
-    let client = reqwest::blocking::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(8))
-        .timeout(Duration::from_secs(20))
-        .user_agent("rust-media/0.1")
-        .build()
-        .map_err(|_| "Could not start provider request")?;
-    let response = client
-        .get(url)
-        .send()
-        .map_err(|_| "Could not reach the video provider")?;
-    if response.status().is_redirection() {
-        return Err("The provider requires a redirect or sign-in".into());
-    }
-    let response = response
-        .error_for_status()
-        .map_err(|_| "The provider refused the request")?;
-    let mut bytes = Vec::new();
-    response
-        .take(4 * 1024 * 1024 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| "Provider response was interrupted")?;
-    if bytes.len() > 4 * 1024 * 1024 {
-        return Err("Provider response exceeds the size limit".into());
-    }
-    Ok(bytes)
+fn fetch(url: &str, cancel: &AtomicBool) -> Result<Vec<u8>, String> {
+    let client = crate::request::Client::new()?;
+    client.read(
+        client.get(url),
+        4 * 1024 * 1024,
+        cancel,
+        Instant::now() + Duration::from_secs(20),
+    )
 }
 
 fn status_id(url: &reqwest::Url) -> Option<String> {
@@ -109,8 +90,8 @@ fn status_id(url: &reqwest::Url) -> Option<String> {
         .then(|| id.into())
 }
 
-fn fixtweet(id: &str) -> Result<Resolved, String> {
-    let bytes = fetch(&format!("https://api.fxtwitter.com/status/{id}"))?;
+fn fixtweet(id: &str, cancel: &AtomicBool) -> Result<Resolved, String> {
+    let bytes = fetch(&format!("https://api.fxtwitter.com/status/{id}"), cancel)?;
     let value: Value = serde_json::from_slice(&bytes).map_err(|_| "Invalid FixupX response")?;
     parse_fixtweet(&value)
 }
@@ -172,7 +153,10 @@ fn youtube_id(url: &reqwest::Url) -> Option<String> {
 }
 
 fn youtube(id: &str, cancel: Arc<AtomicBool>) -> Result<Resolved, String> {
-    let page = fetch(&format!("https://www.youtube.com/watch?v={id}&hl=en"))?;
+    let page = fetch(
+        &format!("https://www.youtube.com/watch?v={id}&hl=en"),
+        &cancel,
+    )?;
     let text = std::str::from_utf8(&page).map_err(|_| "Invalid YouTube response")?;
     let player = [
         "var ytInitialPlayerResponse = ",
@@ -288,6 +272,64 @@ fn youtube_stream_error(data: &Value) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    fn stalled_request_cancels(body_started: bool) {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            sync::{atomic::Ordering, mpsc},
+            time::Instant,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                socket.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            if body_started {
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nx")
+                    .unwrap();
+            }
+            ready_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(3));
+        });
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            result_tx.send(fetch(&url, &worker_cancel)).unwrap();
+        });
+        ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let began = Instant::now();
+        cancel.store(true, Ordering::Relaxed);
+        let result = result_rx.recv_timeout(Duration::from_millis(500));
+        let elapsed = began.elapsed();
+        release_tx.send(()).unwrap();
+        server.join().unwrap();
+        worker.join().unwrap();
+        assert_eq!(result.unwrap(), Err("Video loading cancelled".into()));
+        assert!(elapsed < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn stalled_provider_headers_cancel_promptly() {
+        stalled_request_cancels(false);
+    }
+
+    #[test]
+    fn stalled_provider_body_cancels_promptly() {
+        stalled_request_cancels(true);
+    }
+
     use super::*;
     #[test]
     fn providers_reject_unsafe_addresses() {

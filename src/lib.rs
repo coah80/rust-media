@@ -4,6 +4,7 @@ pub mod fragment;
 pub mod http;
 pub mod player;
 pub mod providers;
+mod request;
 mod sabr_proto;
 mod script;
 mod youtube;

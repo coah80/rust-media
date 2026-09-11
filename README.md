@@ -53,7 +53,7 @@ player.set_volume(0.5);
 let snapshot = player.snapshot();
 ```
 
-Keep the player alive and poll `snapshot()` from the application's event loop. Each snapshot takes the newest available RGBA frame; older undisplayed frames are replaced. `Player` owns one worker, replacing queued loads with the newest request. Dropping or stopping it cancels playback. Network operations have finite timeouts, so a blocked provider request can delay a replacement load.
+Keep the player alive and poll `snapshot()` from the application's event loop. Each snapshot takes the newest available RGBA frame; older undisplayed frames are replaced. `Player` owns one worker, replacing queued loads with the newest request. Dropping or stopping it cancels playback. Provider metadata, YouTube script and SABR requests observe cancellation during both header and body waits. Live YouTube-to-local replacement took 20-40 ms. Ordinary direct-file range reads still use blocking requests with finite timeouts.
 
 `providers::resolve` returns stream addresses or prepared in-memory media. Use `MediaReader::resolved` to open either representation. `resolve_with_cancel` accepts a shared cancellation flag. `decode::Video` accepts a `Read + Seek` source and emits timestamped frames. `http::RemoteFile` implements that interface with 512 KiB reads. The player coordinates these parts and uses the audio playback clock when audio exists.
 

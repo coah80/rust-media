@@ -41,6 +41,18 @@ The [Data API videos.list endpoint](https://developers.google.com/youtube/v3/doc
 
 No compatible, publicly documented verification integration was found in these sources. That finding does not prove that a Rust implementation is impossible. The remaining prerequisite is an integration accepted by the provider that works outside a browser runtime. General YouTube playback remains unverified and Y6 stays open; no playback fix or new binary resulted from this documentation investigation.
 
+## Transport follow-up
+
+The next implementation pass compared the adapter with [Googlevideo's stream implementation](https://github.com/LuanRT/googlevideo/blob/main/src/core/SabrStream.ts). Its handler also treats protection status 3 as requiring attestation. Its partial UMP buffer spans reads within one HTTP response, which does not substantiate the review claim that an unfinished UMP part must be concatenated across separate responses. Rust `read_exact` already handles short reads. The reference also accepts the same five-byte integer prefixes as this adapter; changing those rules solely on the automated review suggestion was not justified.
+
+Two other review findings were reproduced locally and fixed. Refreshing an existing context in a full 32-entry table no longer fails or increases the table size. Track completion rejects media beyond the declared final segment. These checks protect stream state and data integrity; neither explains away the observed protection response.
+
+Provider requests previously ignored cancellation while waiting for headers or stalled body data. Both local stalled-server tests failed before the fix and passed afterward. Provider metadata, script downloads and SABR requests now share a cancellable async Reqwest path on a Rust Tokio runtime. It retains the 8-second connection and 20-second request timeouts, checks cancellation every 20 ms while waiting, and enforces the media-loading deadline during requests. The shared runtime uses one I/O worker and at most two blocking workers. Native DNS work may finish after its caller cancels. Direct-file range reads retain their existing blocking implementation.
+
+Bodies are bounded before assembly, including responses with no declared length. Limits remain 4 MiB for provider metadata, 8 MiB for scripts and 32 MiB for each SABR response. The SABR parser now receives a complete bounded response, so peak memory can include that response in addition to the 128 MiB media budget. Redirects and HTTP 429 stop this request path without automatic retries.
+
+The updated source decoded all 284 frames and 19.064 seconds of audio for the short control clip. Replacing a live YouTube load with the local fixture reached `Playing` with a frame in 0.040 seconds after an early cancellation and 0.020 seconds after a later cancellation. The longer clip was retried once after these changes and still returned client verification. Y6 remains unmet. Temporary live drivers were removed; cancellation/resource-limit and stream-integrity tests remain as regression coverage.
+
 ## References
 
 - [Googlevideo SABR transport and protocol definitions](https://github.com/LuanRT/googlevideo)
