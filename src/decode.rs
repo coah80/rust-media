@@ -465,10 +465,11 @@ impl<R: Read + Seek> FragmentVideo<R> {
         let mut samples = Vec::new();
         let mut expected_time = None;
         for (moof, moof_offset) in moofs {
-            let traf = moof
+            let (traf_index, traf) = moof
                 .trafs
                 .iter()
-                .find(|traf| traf.tfhd.track_id == self.track)
+                .enumerate()
+                .find(|(_, traf)| traf.tfhd.track_id == self.track)
                 .ok_or("Missing video fragment track")?;
             let run = traf.trun.as_ref().ok_or("Missing video fragment run")?;
             if run.sample_count > 100_000 {
@@ -484,12 +485,7 @@ impl<R: Read + Seek> FragmentVideo<R> {
             if expected_time.is_some_and(|expected| expected != time) {
                 return Err("Video fragments are not contiguous".into());
             }
-            let base = traf.tfhd.base_data_offset.unwrap_or(moof_offset);
-            let mut position = base
-                .checked_add_signed(i64::from(
-                    run.data_offset.ok_or("Missing video fragment offset")?,
-                ))
-                .ok_or("Invalid video fragment offset")?;
+            let mut position = fragment_data_start(&moof, traf_index, moof_offset)?;
             for sample_index in 0..run.sample_count as usize {
                 let duration = run
                     .sample_durations
@@ -624,6 +620,46 @@ impl<R: Read + Seek> FragmentVideo<R> {
             Some(self.pending.remove(0))
         })
     }
+}
+
+fn fragment_data_start(
+    moof: &mp4::MoofBox,
+    target: usize,
+    moof_offset: u64,
+) -> Result<u64, String> {
+    let mut preceding_end = moof_offset;
+    for (index, traf) in moof.trafs.iter().enumerate() {
+        let base = traf.tfhd.base_data_offset.unwrap_or({
+            if index == 0 || traf.tfhd.flags & 0x020000 != 0 {
+                moof_offset
+            } else {
+                preceding_end
+            }
+        });
+        let run = traf.trun.as_ref().ok_or("Missing video fragment run")?;
+        let start = base
+            .checked_add_signed(i64::from(run.data_offset.unwrap_or(0)))
+            .ok_or("Invalid video fragment offset")?;
+        if index == target {
+            return Ok(start);
+        }
+        let size = if run.sample_sizes.len() == run.sample_count as usize {
+            run.sample_sizes
+                .iter()
+                .try_fold(0u64, |total, size| total.checked_add(u64::from(*size)))
+        } else if run.sample_sizes.is_empty() {
+            traf.tfhd
+                .default_sample_size
+                .and_then(|size| u64::from(size).checked_mul(u64::from(run.sample_count)))
+        } else {
+            None
+        }
+        .ok_or("Missing preceding fragment sample size")?;
+        preceding_end = start
+            .checked_add(size)
+            .ok_or("Invalid video fragment offset")?;
+    }
+    Err("Missing video fragment track".into())
 }
 
 fn indexed_seek_segment(segments: &[FragmentSegment], target: f64) -> usize {
@@ -1190,5 +1226,43 @@ mod tests {
         let (moofs, mdats) = segment_boxes(&mut std::io::Cursor::new(extended), range).unwrap();
         assert_eq!(moofs.len(), 1);
         assert_eq!(mdats.len(), 1);
+    }
+
+    #[test]
+    fn macroscope_fragment_offsets_follow_previous_traf() {
+        let source = include_bytes!("../tests/fixtures/fragmented.mp4");
+        let moof_kind = source
+            .windows(4)
+            .position(|value| value == b"moof")
+            .unwrap();
+        let moof_start = moof_kind - 4;
+        let moof_size =
+            u32::from_be_bytes(source[moof_start..moof_start + 4].try_into().unwrap()) as usize;
+        let mdat_start = moof_start + moof_size;
+        let mdat_size =
+            u32::from_be_bytes(source[mdat_start..mdat_start + 4].try_into().unwrap()) as usize;
+        let range = moof_start as u64..(mdat_start + mdat_size) as u64;
+        let (mut moofs, _) = segment_boxes(&mut std::io::Cursor::new(source), range).unwrap();
+        let mut moof = moofs.remove(0).0;
+        let mut audio = moof.trafs[0].clone();
+        audio.tfhd.track_id = 1;
+        audio.tfhd.flags = 0;
+        audio.tfhd.base_data_offset = None;
+        let audio_run = audio.trun.as_mut().unwrap();
+        audio_run.sample_count = 2;
+        audio_run.data_offset = Some(100);
+        audio_run.sample_sizes = vec![4, 6];
+        let mut video = audio.clone();
+        video.tfhd.track_id = 2;
+        let video_run = video.trun.as_mut().unwrap();
+        video_run.sample_count = 1;
+        video_run.data_offset = Some(5);
+        video_run.sample_sizes = vec![7];
+        moof.trafs = vec![audio, video];
+        assert_eq!(fragment_data_start(&moof, 1, 1000).unwrap(), 1115);
+        moof.trafs[1].trun.as_mut().unwrap().data_offset = None;
+        assert_eq!(fragment_data_start(&moof, 1, 1000).unwrap(), 1110);
+        moof.trafs[1].tfhd.flags = 0x020000;
+        assert_eq!(fragment_data_start(&moof, 1, 1000).unwrap(), 1000);
     }
 }
