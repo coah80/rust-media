@@ -20,5 +20,5 @@ Scope: an independent Rust media library and native player, with tested direct M
 - [x] G4: live provider probes recorded without claiming unsupported playback
   EVIDENCE: FixupX resolved and decoded 60 frames at 482x360, 19.034-second duration, then passed native playback controls with audio. Public YouTube test returned an unsupported JavaScript-resolver error; README explicitly records that playback did not work. Local 720p probe decoded 60 frames in 0.786 seconds. No private responses or stream URLs committed.
 
-- [ ] G5: independent GitHub repository contains the reviewed source and reproducible instructions
-  EVIDENCE: pending
+- [x] G5: independent GitHub repository contains the reviewed source and reproducible instructions
+  EVIDENCE: Private repository https://github.com/coah80/rust-media created and source pushed. GitHub main SHA matched local initial source commit e39fccd0dd91e678d8797a554e3d8d5b666711e2. README includes run commands, library usage, a generated-fixture screenshot, measured results and explicit YouTube/platform limitations. Final build and UI-free library check passed.
