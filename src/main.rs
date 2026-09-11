@@ -38,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut decoder = if resolved.fragmented {
             MediaVideo::fragmented(source.duplicate()?, source.duplicate()?, size)?
         } else {
-            MediaVideo::standard(source.duplicate()?, size)?
+            MediaVideo::open(source.duplicate()?, source.duplicate()?, size)?
         };
         let mut count = 0;
         let mut first = None;

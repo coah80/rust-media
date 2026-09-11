@@ -23,7 +23,11 @@ pub struct Video<R> {
 }
 
 impl<R: Read + Seek> Video<R> {
-    pub fn new(reader: R, size: u64) -> Result<Self, String> {
+    pub fn new(mut reader: R, size: u64) -> Result<Self, String> {
+        validate_mp4_initialization(&mut reader, size)?;
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| "Could not seek video initialization")?;
         let reader = mp4::Mp4Reader::read_header(reader, size)
             .map_err(|_| "This video is not a supported MP4")?;
         let track = reader
@@ -289,6 +293,10 @@ impl<R: Read + Seek> FragmentVideo<R> {
         header_reader
             .seek(SeekFrom::Start(0))
             .map_err(|_| "Could not seek video initialization")?;
+        validate_mp4_initialization(&mut header_reader, header_end)?;
+        header_reader
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| "Could not seek video initialization")?;
         let defaults = fragment_defaults(&mut header_reader, header_end)?;
         header_reader
             .seek(SeekFrom::Start(0))
@@ -376,6 +384,10 @@ impl<R: Read + Seek> FragmentVideo<R> {
 
     fn new_eager(mut reader: R, mut header_reader: R, size: u64) -> Result<Self, String> {
         let (moof_offsets, mdats) = top_level_boxes(&mut reader, size)?;
+        validate_mp4_initialization(&mut header_reader, size)?;
+        header_reader
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| "Could not seek video initialization")?;
         let defaults = fragment_defaults(&mut header_reader, size)?;
         header_reader
             .seek(SeekFrom::Start(0))
@@ -740,6 +752,18 @@ pub enum MediaVideo<R> {
 }
 
 impl<R: Read + Seek> MediaVideo<R> {
+    pub fn open(mut reader: R, header_reader: R, size: u64) -> Result<Self, String> {
+        let fragmented = is_fragmented(&mut reader, size)?;
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| "Could not seek video")?;
+        if fragmented {
+            Self::fragmented(reader, header_reader, size)
+        } else {
+            Self::standard(reader, size)
+        }
+    }
+
     pub fn standard(reader: R, size: u64) -> Result<Self, String> {
         Video::new(reader, size).map(Box::new).map(Self::Standard)
     }
@@ -777,6 +801,102 @@ impl<R: Read + Seek> MediaVideo<R> {
             Self::Fragmented(video) => video.frame(),
         }
     }
+}
+
+fn is_fragmented<R: Read + Seek>(reader: &mut R, size: u64) -> Result<bool, String> {
+    let mut offset = 0u64;
+    let mut boxes = 0usize;
+    while offset < size {
+        boxes += 1;
+        if boxes > 100_000 {
+            return Err("Video exceeds the box limit".into());
+        }
+        reader
+            .seek(SeekFrom::Start(offset))
+            .map_err(|_| "Could not seek video")?;
+        let (kind, _, end) = box_header(reader, offset, size)?;
+        if &kind == b"moof" {
+            return Ok(true);
+        }
+        offset = end;
+    }
+    Ok(false)
+}
+
+pub(crate) fn validate_mp4_initialization<R: Read + Seek>(
+    reader: &mut R,
+    size: u64,
+) -> Result<(), String> {
+    let mut boxes = 0usize;
+    let mut samples = 0usize;
+    let mut entries = 0usize;
+    validate_mp4_box_range(reader, 0, size, 0, &mut boxes, &mut samples, &mut entries)
+}
+
+fn validate_mp4_box_range<R: Read + Seek>(
+    reader: &mut R,
+    start: u64,
+    end: u64,
+    depth: usize,
+    boxes: &mut usize,
+    samples: &mut usize,
+    entries: &mut usize,
+) -> Result<(), String> {
+    if depth > 8 {
+        return Err("Video initialization is nested too deeply".into());
+    }
+    let mut offset = start;
+    while offset < end {
+        *boxes += 1;
+        if *boxes > 100_000 {
+            return Err("Video exceeds the box limit".into());
+        }
+        reader
+            .seek(SeekFrom::Start(offset))
+            .map_err(|_| "Could not seek video initialization")?;
+        let (kind, _, box_end) = box_header(reader, offset, end)?;
+        let payload = reader
+            .stream_position()
+            .map_err(|_| "Could not read video initialization")?;
+        if matches!(
+            &kind,
+            b"moov" | b"trak" | b"mdia" | b"minf" | b"stbl" | b"edts" | b"mvex"
+        ) {
+            validate_mp4_box_range(reader, payload, box_end, depth + 1, boxes, samples, entries)?;
+        } else if &kind == b"stsz" {
+            if box_end - payload < 12 {
+                return Err("Invalid video sample table".into());
+            }
+            let mut header = [0; 12];
+            reader
+                .read_exact(&mut header)
+                .map_err(|_| "Could not read video initialization")?;
+            let count = u32::from_be_bytes(header[8..12].try_into().unwrap()) as usize;
+            ensure_fragment_sample_limit(*samples, count)?;
+            *samples += count;
+        } else if matches!(
+            &kind,
+            b"stts" | b"ctts" | b"stsc" | b"stss" | b"stco" | b"co64" | b"elst"
+        ) {
+            if box_end - payload < 8 {
+                return Err("Invalid video sample table".into());
+            }
+            let mut header = [0; 8];
+            reader
+                .read_exact(&mut header)
+                .map_err(|_| "Could not read video initialization")?;
+            let count = u32::from_be_bytes(header[4..8].try_into().unwrap()) as usize;
+            if entries
+                .checked_add(count)
+                .is_none_or(|total| total > 1_000_000)
+            {
+                return Err("Video exceeds the initialization entry limit".into());
+            }
+            *entries += count;
+        }
+        offset = box_end;
+    }
+    Ok(())
 }
 
 fn fragment_defaults<R: Read + Seek>(
@@ -1062,6 +1182,7 @@ fn segment_boxes<R: Read + Seek>(
     let mut moofs = Vec::new();
     let mut mdats = Vec::new();
     let mut boxes = 0usize;
+    let mut samples = 0usize;
     while offset < range.end {
         boxes += 1;
         if boxes > 100_000 {
@@ -1076,7 +1197,7 @@ fn segment_boxes<R: Read + Seek>(
             .map_err(|_| "Could not read video segment")?;
         match &kind {
             b"moof" => {
-                validate_fragment_runs(reader, payload_start, end, None)?;
+                validate_fragment_runs(reader, payload_start, end, None, &mut samples)?;
                 reader
                     .seek(SeekFrom::Start(payload_start))
                     .map_err(|_| "Could not seek video fragment")?;
@@ -1145,6 +1266,7 @@ fn top_level_boxes<R: Read + Seek>(
     let mut moofs = Vec::new();
     let mut mdats = Vec::new();
     let mut boxes = 0usize;
+    let mut samples = 0usize;
     while offset < size {
         boxes += 1;
         if boxes > 100_000 {
@@ -1177,7 +1299,7 @@ fn top_level_boxes<R: Read + Seek>(
             .ok_or("Invalid video fragment box")?;
         match &header[4..8] {
             b"moof" => {
-                validate_fragment_runs(reader, offset + header_size, end, None)?;
+                validate_fragment_runs(reader, offset + header_size, end, None, &mut samples)?;
                 moofs.push(offset);
             }
             b"mdat" => mdats.push(offset + header_size..end),
@@ -1204,10 +1326,10 @@ pub(crate) fn validate_fragment_runs<R: Read + Seek>(
     start: u64,
     end: u64,
     cancel: Option<&AtomicBool>,
+    samples: &mut usize,
 ) -> Result<(), String> {
     let mut child = start;
     let mut boxes = 0usize;
-    let mut samples = 0usize;
     while child < end {
         if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
             return Err("Video fragment parsing cancelled".into());
@@ -1258,8 +1380,8 @@ pub(crate) fn validate_fragment_runs<R: Read + Seek>(
                     if sample_count > 100_000 {
                         return Err("Video fragment exceeds the sample limit".into());
                     }
-                    ensure_fragment_sample_limit(samples, sample_count)?;
-                    samples += sample_count;
+                    ensure_fragment_sample_limit(*samples, sample_count)?;
+                    *samples += sample_count;
                 }
                 nested = nested_end;
             }
@@ -1343,6 +1465,45 @@ mod tests {
             ensure_fragment_sample_limit(900_001, 100_000).unwrap_err(),
             "Video exceeds the sample limit"
         );
+    }
+
+    #[test]
+    fn macroscope_fragment_sample_limit_spans_moofs() {
+        let mut source = include_bytes!("../tests/fixtures/fragmented.mp4").to_vec();
+        let moof_kind = source
+            .windows(4)
+            .position(|value| value == b"moof")
+            .unwrap();
+        let moof_start = moof_kind - 4;
+        let moof_size =
+            u32::from_be_bytes(source[moof_start..moof_start + 4].try_into().unwrap()) as usize;
+        let trun = source[moof_start..moof_start + moof_size]
+            .windows(4)
+            .position(|value| value == b"trun")
+            .map(|position| moof_start + position)
+            .unwrap();
+        source[trun + 8..trun + 12].copy_from_slice(&100_000u32.to_be_bytes());
+        let mut reader = std::io::Cursor::new(source);
+        let mut samples = 0usize;
+        for _ in 0..10 {
+            validate_fragment_runs(
+                &mut reader,
+                (moof_start + 8) as u64,
+                (moof_start + moof_size) as u64,
+                None,
+                &mut samples,
+            )
+            .unwrap();
+        }
+        let error = validate_fragment_runs(
+            &mut reader,
+            (moof_start + 8) as u64,
+            (moof_start + moof_size) as u64,
+            None,
+            &mut samples,
+        )
+        .unwrap_err();
+        assert_eq!(error, "Video exceeds the sample limit");
     }
 
     #[test]

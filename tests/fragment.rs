@@ -245,6 +245,16 @@ fn set_first_trun_sample_count(bytes: &[u8], count: u32) -> Vec<u8> {
     output
 }
 
+fn set_first_stsz_sample_count(bytes: &[u8], count: u32) -> Vec<u8> {
+    let mut output = bytes.to_vec();
+    let stsz = output
+        .windows(4)
+        .position(|value| value == b"stsz")
+        .unwrap();
+    output[stsz + 12..stsz + 16].copy_from_slice(&count.to_be_bytes());
+    output
+}
+
 fn extend_mdat_headers(bytes: &[u8]) -> Vec<u8> {
     let mut source = bytes.to_vec();
     let mut offset = 0usize;
@@ -556,6 +566,18 @@ fn fragmented_video_decodes_without_full_remux() {
         count += 1;
     }
     assert_eq!(count, 48);
+}
+
+#[test]
+fn fragmented_video_is_detected_automatically() {
+    let bytes = include_bytes!("fixtures/fragmented.mp4");
+    let mut video =
+        MediaVideo::open(Cursor::new(bytes), Cursor::new(bytes), bytes.len() as u64).unwrap();
+    let mut frames = 0;
+    while video.frame().unwrap().is_some() {
+        frames += 1;
+    }
+    assert_eq!(frames, 48);
 }
 
 #[test]
@@ -875,6 +897,21 @@ fn macroscope_fragment_run_sample_count_is_bounded_before_parsing() {
         Err(error) => error,
     };
     assert_eq!(error, "Video fragment exceeds the sample limit");
+}
+
+#[test]
+fn macroscope_initialization_sample_count_is_bounded_before_parsing() {
+    let (bytes, _) = indexed_fixture();
+    let bytes = set_first_stsz_sample_count(&bytes, u32::MAX);
+    let error = match MediaVideo::fragmented(
+        Cursor::new(&bytes),
+        Cursor::new(&bytes),
+        bytes.len() as u64,
+    ) {
+        Ok(_) => panic!("oversized sample table was accepted"),
+        Err(error) => error,
+    };
+    assert_eq!(error, "Video exceeds the sample limit");
 }
 
 #[test]

@@ -307,7 +307,7 @@ fn playback(
     let mut video = if resolved.fragmented {
         MediaVideo::fragmented(source.duplicate()?, source.duplicate()?, size)?
     } else {
-        MediaVideo::standard(source.duplicate()?, size)?
+        MediaVideo::open(source.duplicate()?, source.duplicate()?, size)?
     };
     let mut next = video.frame()?;
     let audio = if video.has_audio() || audio_source.is_some() {

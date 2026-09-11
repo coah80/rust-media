@@ -15,6 +15,7 @@ fn remux_inner(data: &[u8], cancel: &AtomicBool) -> Result<Vec<u8>, Box<dyn std:
     let mut box_count = 0usize;
     let mut moofs = Vec::new();
     let mut mdats = Vec::new();
+    let mut samples = 0usize;
     while offset < data.len() {
         if cancel.load(Ordering::Relaxed) {
             return Err("assembly cancelled".into());
@@ -46,6 +47,7 @@ fn remux_inner(data: &[u8], cancel: &AtomicBool) -> Result<Vec<u8>, Box<dyn std:
                 (offset + header_size) as u64,
                 (offset + size) as u64,
                 Some(cancel),
+                &mut samples,
             )?;
             moofs.push(offset);
         }
@@ -54,6 +56,8 @@ fn remux_inner(data: &[u8], cancel: &AtomicBool) -> Result<Vec<u8>, Box<dyn std:
         }
         offset += size;
     }
+    let mut initialization = Cursor::new(data);
+    crate::decode::validate_mp4_initialization(&mut initialization, data.len() as u64)?;
     let reader = mp4::Mp4Reader::read_header(Cursor::new(data), data.len() as u64)?;
     if cancel.load(Ordering::Relaxed) {
         return Err("assembly cancelled".into());
