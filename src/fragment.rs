@@ -12,15 +12,26 @@ fn remux_inner(data: &[u8], cancel: &AtomicBool) -> Result<Vec<u8>, Box<dyn std:
         return Err("assembly cancelled or too large".into());
     }
     let mut offset = 0usize;
+    let mut box_count = 0usize;
     let mut moofs = Vec::new();
     let mut mdats = Vec::new();
     while offset < data.len() {
+        box_count += 1;
+        if box_count > 100_000 {
+            return Err("too many top-level boxes".into());
+        }
         let header = data.get(offset..offset + 8).ok_or("short box")?;
         let size = u32::from_be_bytes(header[..4].try_into()?) as usize;
         if size < 8 || size > data.len() - offset {
             return Err("invalid box".into());
         }
         if &header[4..8] == b"moof" {
+            let mut reader = Cursor::new(data);
+            crate::decode::validate_fragment_runs(
+                &mut reader,
+                (offset + 8) as u64,
+                (offset + size) as u64,
+            )?;
             moofs.push(offset);
         }
         if &header[4..8] == b"mdat" {
@@ -162,4 +173,24 @@ fn remux_inner(data: &[u8], cancel: &AtomicBool) -> Result<Vec<u8>, Box<dyn std:
     }
     writer.write_end()?;
     Ok(writer.into_writer().into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn macroscope_rejects_excessive_top_level_boxes() {
+        let mut data = Vec::with_capacity(800_008);
+        for _ in 0..100_001 {
+            data.extend_from_slice(&8u32.to_be_bytes());
+            data.extend_from_slice(b"mdat");
+        }
+        assert_eq!(
+            remux_inner(&data, &AtomicBool::new(false))
+                .unwrap_err()
+                .to_string(),
+            "too many top-level boxes"
+        );
+    }
 }

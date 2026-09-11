@@ -1,6 +1,6 @@
 # Rust Media
 
-An experimental Rust video library with an optional native Slint player. The API is pre-1.0 and may change; this is not a production reliability guarantee. It resolves supported video links to media streams, reads MP4 data in byte ranges, decodes H.264 in Rust, plays AAC through Rodio/Symphonia, and gives the UI RGBA frames.
+A production-ready Rust video library for the documented Windows playback contract, with an optional native Slint player. The API is pre-1.0 and may change. It resolves supported video links to media streams, reads MP4 data in byte ranges, decodes H.264 in Rust, plays AAC through Rodio/Symphonia, and gives the UI RGBA frames.
 
 There is no WebView, browser engine, mpv, FFmpeg runtime, or Python helper. YouTube URL transformation uses Boa, a JavaScript interpreter written in Rust, with a Rust SWC preprocessor. No Node, Deno, V8 or QuickJS runtime is used. Windowing, graphics, audio output, TLS and other platform services still use their normal native dependencies. This is not a claim that every dependency or operating-system component is written in Rust.
 
@@ -17,6 +17,12 @@ There is no WebView, browser engine, mpv, FFmpeg runtime, or Python helper. YouT
 | HTML, JavaScript widgets, arbitrary iframes | Not implemented |
 
 The demo has volume, mute, fullscreen, keyboard controls, a seek bar, and controls that hide during playback. It is a standalone experiment, not a Discord player parity claim or a completed Fastcord integration.
+
+## Production contract
+
+Windows x64 playback is production-ready for supported local files, allowlisted direct MP4 URLs, public FixupX posts and public YouTube videos that resolve to H.264/AAC within the limits below. Supported inputs must fail with an error instead of substituting media or bypassing a limit. Provider availability is outside the library's control, and macOS/Linux remain preview targets until current device playback passes there.
+
+Production-ready here covers bounded loading, deterministic decode and seek output, cancellation, replay, replacement, audio playback, the public `Player` API and both Windows Slint renderers. It does not expand the codec, container, provider or duration contract.
 
 ## Run
 
@@ -80,7 +86,7 @@ cargo doc --locked --no-deps
 cargo check --locked --no-default-features --lib
 ```
 
-The benchmark report covers 53,913 frames across four complete videos, repeated startup, 240 seek comparisons and both Windows renderers. Listening quality, perceptual lip sync, sustained bandwidth starvation and this revision on macOS/Linux remain unverified. CI checks builds and synthetic tests on all three platforms; that does not establish device playback quality.
+The benchmark report covers 53,913 frames across four complete videos, a current 21,313-frame rerun of the longest video, repeated startup, deterministic stress and both Windows renderers. Listening quality, perceptual lip sync, sustained bandwidth starvation and this revision on macOS/Linux remain unverified. Hosted CI is configured for Windows, macOS and Linux builds and synthetic tests; that does not establish device playback quality.
 
 See [contributing](CONTRIBUTING.md) for validation and release requirements. `cargo run --release --locked --example play -- clip.mp4` runs the playback worker with audio while discarding video frames. Generate API docs with `cargo doc --no-deps`.
 

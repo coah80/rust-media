@@ -4,7 +4,7 @@ use prost::Message;
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    io::{self, Read},
+    io,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -226,6 +226,8 @@ pub(crate) fn prepare(
     let mut cookie = None;
     let mut contexts = BTreeMap::<i32, Vec<u8>>::new();
     let mut send_contexts = HashSet::new();
+    let mut parts = PartBuffer::default();
+    let mut headers = HashMap::<u32, (p::Header, Vec<u8>)>::new();
     let mut total = 0usize;
     let mut redirects = 0;
     let mut stalled = 0;
@@ -279,12 +281,10 @@ pub(crate) fn prepare(
             .body(request.encode_to_vec());
         let body = client.read(request, 32 * 1024 * 1024, &cancel, deadline)?;
         let before = total;
-        let mut response = body.as_slice();
-        let mut headers = HashMap::<u32, (p::Header, Vec<u8>)>::new();
+        let pending_before = parts.len();
+        parts.push(&body)?;
         let mut backoff = 0;
-        while let Some((kind, data)) =
-            read_part(&mut response).map_err(|_| "Invalid YouTube media response")?
-        {
+        while let Some((kind, data)) = parts.next().map_err(|_| "Invalid YouTube media response")? {
             check(&cancel, deadline)?;
             match kind {
                 20 => {
@@ -365,14 +365,7 @@ pub(crate) fn prepare(
                 }
                 59 => {
                     let policy = decode::<p::ContextPolicy>(&data)?;
-                    send_contexts.extend(policy.start);
-                    for kind in policy.stop {
-                        send_contexts.remove(&kind);
-                    }
-                    for kind in policy.discard {
-                        send_contexts.remove(&kind);
-                        contexts.remove(&kind);
-                    }
+                    apply_context_policy(&mut contexts, &mut send_contexts, policy);
                 }
                 58 => {
                     let protection = decode::<p::Protection>(&data)?;
@@ -383,17 +376,21 @@ pub(crate) fn prepare(
                 _ => {}
             }
         }
-        if !headers.is_empty() {
-            return Err("YouTube ended an incomplete segment".into());
-        }
         if tracks.iter().all(Track::complete) {
+            if !headers.is_empty() || !parts.is_empty() {
+                return Err("YouTube ended an incomplete segment".into());
+            }
             let [video, audio] = tracks;
             return Ok(Prepared {
                 video: video.finish(&cancel, true)?,
                 audio: audio.finish(&cancel, false)?,
             });
         }
-        stalled = if total == before { stalled + 1 } else { 0 };
+        stalled = if total == before && parts.len() <= pending_before {
+            stalled + 1
+        } else {
+            0
+        };
         if stalled >= 3 {
             return Err("YouTube stopped providing media data".into());
         }
@@ -444,6 +441,26 @@ fn update_context(
     }
     Ok(())
 }
+
+fn apply_context_policy(
+    contexts: &mut BTreeMap<i32, Vec<u8>>,
+    send_contexts: &mut HashSet<i32>,
+    policy: p::ContextPolicy,
+) {
+    send_contexts.extend(
+        policy
+            .start
+            .into_iter()
+            .filter(|kind| contexts.contains_key(kind)),
+    );
+    for kind in policy.stop {
+        send_contexts.remove(&kind);
+    }
+    for kind in policy.discard {
+        send_contexts.remove(&kind);
+        contexts.remove(&kind);
+    }
+}
 fn check(cancel: &AtomicBool, deadline: Instant) -> Result<(), String> {
     if cancel.load(Ordering::Relaxed) {
         Err("Video loading cancelled".into())
@@ -463,7 +480,8 @@ fn json_after(text: &str, marker: &str) -> Option<Value> {
 fn decode<T: Message + Default>(data: &[u8]) -> Result<T, String> {
     T::decode(data).map_err(|_| "Invalid YouTube streaming metadata".into())
 }
-fn read_uint(input: &mut impl Read) -> io::Result<Option<u32>> {
+#[cfg(test)]
+fn read_uint(input: &mut impl std::io::Read) -> io::Result<Option<u32>> {
     let mut first = [0u8];
     if input.read(&mut first)? == 0 {
         return Ok(None);
@@ -477,8 +495,10 @@ fn read_uint(input: &mut impl Read) -> io::Result<Option<u32>> {
         3
     } else if first < 240 {
         4
-    } else {
+    } else if first < 248 {
         5
+    } else {
+        return Err(io::ErrorKind::InvalidData.into());
     };
     if width == 1 {
         return Ok(Some(u32::from(first)));
@@ -492,7 +512,8 @@ fn read_uint(input: &mut impl Read) -> io::Result<Option<u32>> {
         (u32::from(first) & (127 >> (width - 1))) | tail << (8 - width)
     }))
 }
-fn read_part(input: &mut impl Read) -> io::Result<Option<(u32, Vec<u8>)>> {
+#[cfg(test)]
+fn read_part(input: &mut impl std::io::Read) -> io::Result<Option<(u32, Vec<u8>)>> {
     let Some(kind) = read_uint(input)? else {
         return Ok(None);
     };
@@ -505,11 +526,87 @@ fn read_part(input: &mut impl Read) -> io::Result<Option<(u32, Vec<u8>)>> {
     Ok(Some((kind, data)))
 }
 
+#[derive(Default)]
+struct PartBuffer(Vec<u8>);
+
+impl PartBuffer {
+    fn push(&mut self, bytes: &[u8]) -> Result<(), String> {
+        if self.0.len().saturating_add(bytes.len()) > 40 * 1024 * 1024 {
+            return Err("YouTube response buffering exceeds the limit".into());
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn next(&mut self) -> io::Result<Option<(u32, Vec<u8>)>> {
+        let Some((kind, kind_width)) = parse_uint(&self.0)? else {
+            return Ok(None);
+        };
+        let Some((size, size_width)) = parse_uint(&self.0[kind_width..])? else {
+            return Ok(None);
+        };
+        let size = size as usize;
+        if size > MAX_PART {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        let header = kind_width + size_width;
+        let end = header.checked_add(size).ok_or(io::ErrorKind::InvalidData)?;
+        if self.0.len() < end {
+            return Ok(None);
+        }
+        let data = self.0[header..end].to_vec();
+        self.0.drain(..end);
+        Ok(Some((kind, data)))
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+fn parse_uint(input: &[u8]) -> io::Result<Option<(u32, usize)>> {
+    let Some(&first) = input.first() else {
+        return Ok(None);
+    };
+    let width = if first < 128 {
+        1
+    } else if first < 192 {
+        2
+    } else if first < 224 {
+        3
+    } else if first < 240 {
+        4
+    } else if first < 248 {
+        5
+    } else {
+        return Err(io::ErrorKind::InvalidData.into());
+    };
+    if input.len() < width {
+        return Ok(None);
+    }
+    if width == 1 {
+        return Ok(Some((u32::from(first), 1)));
+    }
+    let mut tail = [0u8; 4];
+    tail[..width - 1].copy_from_slice(&input[1..width]);
+    let tail = u32::from_le_bytes(tail);
+    let value = if width == 5 {
+        tail
+    } else {
+        (u32::from(first) & (127 >> (width - 1))) | tail << (8 - width)
+    };
+    Ok(Some((value, width)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn full_context_table_accepts_refresh_without_growing() {
+    fn macroscope_full_context_table_accepts_refresh_without_growing() {
         let mut contexts: BTreeMap<_, _> = (0..32).map(|kind| (kind, vec![1])).collect();
         let mut send = HashSet::new();
         let update = |kind, policy| p::ContextUpdate {
@@ -528,7 +625,7 @@ mod tests {
     }
 
     #[test]
-    fn finished_track_rejects_media_after_declared_end() {
+    fn macroscope_finished_track_rejects_media_after_declared_end() {
         let mut track = Track::new(&serde_json::json!({"itag":140,"lastModified":"1"})).unwrap();
         track.init = vec![0];
         track.final_segment = Some(1);
@@ -580,6 +677,40 @@ mod tests {
         ] {
             assert_eq!(read_uint(&mut &bytes[..]).unwrap(), Some(expected));
         }
+    }
+
+    #[test]
+    fn macroscope_rejects_reserved_uint_prefixes() {
+        for prefix in 248..=255 {
+            let error = read_uint(&mut &[prefix, 0, 0, 0, 0][..]).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[test]
+    fn macroscope_context_policy_only_starts_known_kinds() {
+        let mut contexts = BTreeMap::from([(7, vec![1])]);
+        let mut send = HashSet::new();
+        apply_context_policy(
+            &mut contexts,
+            &mut send,
+            p::ContextPolicy {
+                start: (0..10_000).collect(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(send, HashSet::from([7]));
+    }
+
+    #[test]
+    fn macroscope_ump_part_spans_responses() {
+        let mut parts = PartBuffer::default();
+        parts.push(&[21, 4, 0, 1]).unwrap();
+        assert!(parts.next().unwrap().is_none());
+        assert_eq!(parts.len(), 4);
+        parts.push(&[2, 3]).unwrap();
+        assert_eq!(parts.next().unwrap(), Some((21, vec![0, 1, 2, 3])));
+        assert!(parts.is_empty());
     }
     #[test]
     fn invalid_media_time_does_not_overflow_or_divide_by_zero() {

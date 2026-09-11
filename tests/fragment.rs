@@ -62,6 +62,10 @@ impl Seek for LimitedCursor {
 }
 
 fn indexed_fixture() -> (Arc<[u8]>, usize) {
+    indexed_fixture_with_origin(0)
+}
+
+fn indexed_fixture_with_origin(origin: u32) -> (Arc<[u8]>, usize) {
     let source = include_bytes!("fixtures/fragmented.mp4");
     let parsed = mp4::Mp4Reader::read_header(Cursor::new(source), source.len() as u64).unwrap();
     let track = parsed.tracks().values().next().unwrap();
@@ -115,7 +119,7 @@ fn indexed_fixture() -> (Arc<[u8]>, usize) {
     sidx.extend_from_slice(&[0; 4]);
     sidx.extend_from_slice(&track_id.to_be_bytes());
     sidx.extend_from_slice(&track.timescale().to_be_bytes());
-    sidx.extend_from_slice(&0u32.to_be_bytes());
+    sidx.extend_from_slice(&origin.to_be_bytes());
     sidx.extend_from_slice(&0u32.to_be_bytes());
     sidx.extend_from_slice(&0u16.to_be_bytes());
     sidx.extend_from_slice(&(ranges.len() as u16).to_be_bytes());
@@ -130,7 +134,95 @@ fn indexed_fixture() -> (Arc<[u8]>, usize) {
     bytes.extend_from_slice(&source[..start]);
     bytes.extend_from_slice(&sidx);
     bytes.extend_from_slice(&source[start..]);
+    shift_fragment_times(&mut bytes, u64::from(origin));
     (bytes.into(), first_end)
+}
+
+fn shift_fragment_times(bytes: &mut [u8], shift: u64) {
+    let mut cursor = 0usize;
+    while let Some(relative) = bytes[cursor..]
+        .windows(4)
+        .position(|value| value == b"tfdt")
+    {
+        let kind = cursor + relative;
+        let version = bytes[kind + 4];
+        if version == 0 {
+            let start = kind + 8;
+            let value = u32::from_be_bytes(bytes[start..start + 4].try_into().unwrap());
+            bytes[start..start + 4].copy_from_slice(
+                &(u64::from(value) + shift)
+                    .try_into()
+                    .unwrap_or(u32::MAX)
+                    .to_be_bytes(),
+            );
+        } else {
+            let start = kind + 8;
+            let value = u64::from_be_bytes(bytes[start..start + 8].try_into().unwrap());
+            bytes[start..start + 8].copy_from_slice(&(value + shift).to_be_bytes());
+        }
+        cursor = kind + 4;
+    }
+}
+
+fn add_fragment_edit(bytes: &[u8], media_time: u32, segment_duration: u32) -> Vec<u8> {
+    let mut output = bytes.to_vec();
+    shift_fragment_times(&mut output, u64::from(media_time));
+    let trak_kind = output
+        .windows(4)
+        .position(|value| value == b"trak")
+        .unwrap();
+    let trak_start = trak_kind - 4;
+    let trak_size = u32::from_be_bytes(output[trak_start..trak_start + 4].try_into().unwrap());
+    let moov_kind = output[..trak_start]
+        .windows(4)
+        .rposition(|value| value == b"moov")
+        .unwrap();
+    let moov_start = moov_kind - 4;
+    let moov_size = u32::from_be_bytes(output[moov_start..moov_start + 4].try_into().unwrap());
+    let mut edit = Vec::new();
+    edit.extend_from_slice(&36u32.to_be_bytes());
+    edit.extend_from_slice(b"edts");
+    edit.extend_from_slice(&28u32.to_be_bytes());
+    edit.extend_from_slice(b"elst");
+    edit.extend_from_slice(&[0; 4]);
+    edit.extend_from_slice(&1u32.to_be_bytes());
+    edit.extend_from_slice(&segment_duration.to_be_bytes());
+    edit.extend_from_slice(&media_time.to_be_bytes());
+    edit.extend_from_slice(&1u16.to_be_bytes());
+    edit.extend_from_slice(&0u16.to_be_bytes());
+    let insert = trak_start + trak_size as usize;
+    output.splice(insert..insert, edit);
+    output[trak_start..trak_start + 4].copy_from_slice(&(trak_size + 36).to_be_bytes());
+    output[moov_start..moov_start + 4].copy_from_slice(&(moov_size + 36).to_be_bytes());
+    output
+}
+
+fn duplicate_first_trun(bytes: &[u8]) -> Vec<u8> {
+    let mut output = bytes.to_vec();
+    let trun_kind = output
+        .windows(4)
+        .position(|value| value == b"trun")
+        .unwrap();
+    let trun_start = trun_kind - 4;
+    let trun_size = u32::from_be_bytes(output[trun_start..trun_start + 4].try_into().unwrap());
+    let traf_kind = output[..trun_start]
+        .windows(4)
+        .rposition(|value| value == b"traf")
+        .unwrap();
+    let traf_start = traf_kind - 4;
+    let traf_size = u32::from_be_bytes(output[traf_start..traf_start + 4].try_into().unwrap());
+    let moof_kind = output[..traf_start]
+        .windows(4)
+        .rposition(|value| value == b"moof")
+        .unwrap();
+    let moof_start = moof_kind - 4;
+    let moof_size = u32::from_be_bytes(output[moof_start..moof_start + 4].try_into().unwrap());
+    let duplicate = output[trun_start..trun_start + trun_size as usize].to_vec();
+    let insert = traf_start + traf_size as usize;
+    output.splice(insert..insert, duplicate);
+    output[traf_start..traf_start + 4].copy_from_slice(&(traf_size + trun_size).to_be_bytes());
+    output[moof_start..moof_start + 4].copy_from_slice(&(moof_size + trun_size).to_be_bytes());
+    output
 }
 
 #[test]
@@ -311,4 +403,92 @@ fn delayed_short_reads_and_interruption_preserve_frames() {
     }
     assert_eq!(count, 48);
     assert!(actual.frame().unwrap().is_none());
+}
+
+#[test]
+fn macroscope_indexed_timeline_starts_at_zero() {
+    let source = include_bytes!("fixtures/fragmented.mp4");
+    let parsed = mp4::Mp4Reader::read_header(Cursor::new(source), source.len() as u64).unwrap();
+    let timescale = parsed.tracks().values().next().unwrap().timescale();
+    let (bytes, _) = indexed_fixture_with_origin(timescale * 5);
+    let mut video = MediaVideo::fragmented(
+        Cursor::new(bytes.clone()),
+        Cursor::new(bytes.clone()),
+        bytes.len() as u64,
+    )
+    .unwrap();
+    let first = video.frame().unwrap().unwrap();
+    let (baseline, _) = indexed_fixture();
+    let mut baseline_video = MediaVideo::fragmented(
+        Cursor::new(baseline.clone()),
+        Cursor::new(baseline.clone()),
+        baseline.len() as u64,
+    )
+    .unwrap();
+    let baseline_first = baseline_video.frame().unwrap().unwrap();
+    assert!((first.0 - baseline_first.0).abs() < 1e-9);
+    assert_eq!(first.1.rgba, baseline_first.1.rgba);
+    assert!((video.duration() - 2.).abs() < 0.001);
+    video.seek(1.).unwrap();
+    let seeked = loop {
+        let frame = video.frame().unwrap().unwrap();
+        if frame.0 >= 1. {
+            break frame;
+        }
+    };
+    let mut expected = MediaVideo::fragmented(
+        Cursor::new(baseline.clone()),
+        Cursor::new(baseline.clone()),
+        baseline.len() as u64,
+    )
+    .unwrap();
+    expected.seek(1.).unwrap();
+    let expected = loop {
+        let frame = expected.frame().unwrap().unwrap();
+        if frame.0 >= 1. {
+            break frame;
+        }
+    };
+    assert!((seeked.0 - expected.0).abs() < 1e-9);
+    assert_eq!(seeked.1.rgba, expected.1.rgba);
+}
+
+#[test]
+fn macroscope_fragment_edit_uses_movie_timeline() {
+    let source = include_bytes!("fixtures/fragmented.mp4");
+    let parsed = mp4::Mp4Reader::read_header(Cursor::new(source), source.len() as u64).unwrap();
+    let track_scale = parsed.tracks().values().next().unwrap().timescale();
+    let movie_duration = parsed.timescale() * 2;
+    let bytes = add_fragment_edit(source, track_scale, movie_duration);
+    let mut video = MediaVideo::fragmented(
+        Cursor::new(bytes.clone()),
+        Cursor::new(bytes.clone()),
+        bytes.len() as u64,
+    )
+    .unwrap();
+    let first = video.frame().unwrap().unwrap();
+    let mut baseline = MediaVideo::fragmented(
+        Cursor::new(source),
+        Cursor::new(source),
+        source.len() as u64,
+    )
+    .unwrap();
+    let baseline_first = baseline.frame().unwrap().unwrap();
+    assert!((first.0 - baseline_first.0).abs() < 1e-9);
+    assert_eq!(first.1.rgba, baseline_first.1.rgba);
+    assert!((video.duration() - 2.).abs() < 0.001);
+}
+
+#[test]
+fn macroscope_multiple_fragment_runs_are_rejected() {
+    let bytes = duplicate_first_trun(include_bytes!("fixtures/fragmented.mp4"));
+    let error = match MediaVideo::fragmented(
+        Cursor::new(bytes.clone()),
+        Cursor::new(bytes.clone()),
+        bytes.len() as u64,
+    ) {
+        Ok(_) => panic!("multiple runs were accepted"),
+        Err(error) => error,
+    };
+    assert_eq!(error, "Multiple video fragment runs are not supported");
 }

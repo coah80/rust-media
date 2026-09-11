@@ -48,60 +48,72 @@ impl Client {
             })
             .as_ref()
             .map_err(Clone::clone)?;
-        runtime.block_on(async {
-            let interrupted = async {
-                loop {
-                    if cancel.load(Ordering::Relaxed) {
-                        break "Video loading cancelled";
+        let execute = move || {
+            runtime.block_on(async move {
+                let interrupted = async {
+                    loop {
+                        if cancel.load(Ordering::Relaxed) {
+                            break "Video loading cancelled";
+                        }
+                        if Instant::now() >= deadline {
+                            break "Video loading timed out";
+                        }
+                        tokio::time::sleep(Duration::from_millis(20)).await;
                     }
-                    if Instant::now() >= deadline {
-                        break "Video loading timed out";
+                };
+                let receive = async {
+                    let mut response = request
+                        .send()
+                        .await
+                        .map_err(|_| "Could not reach the video provider")?;
+                    if !response.status().is_success() {
+                        return Err(format!(
+                            "Video provider refused the request, HTTP {}",
+                            response.status().as_u16()
+                        ));
                     }
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            };
-            let receive = async {
-                let mut response = request
-                    .send()
-                    .await
-                    .map_err(|_| "Could not reach the video provider")?;
-                if !response.status().is_success() {
-                    return Err(format!(
-                        "Video provider refused the request, HTTP {}",
-                        response.status().as_u16()
-                    ));
-                }
-                if response
-                    .content_length()
-                    .is_some_and(|size| size > max as u64)
-                {
-                    return Err("Video response exceeds the size limit".into());
-                }
-                let mut bytes = Vec::new();
-                while let Some(chunk) = response
-                    .chunk()
-                    .await
-                    .map_err(|_| "Video response was interrupted")?
-                {
-                    if cancel.load(Ordering::Relaxed) {
-                        return Err("Video loading cancelled".into());
-                    }
-                    if Instant::now() >= deadline {
-                        return Err("Video loading timed out".into());
-                    }
-                    if chunk.len() > max - bytes.len() {
+                    if response
+                        .content_length()
+                        .is_some_and(|size| size > max as u64)
+                    {
                         return Err("Video response exceeds the size limit".into());
                     }
-                    bytes.extend_from_slice(&chunk);
+                    let mut bytes = Vec::new();
+                    while let Some(chunk) = response
+                        .chunk()
+                        .await
+                        .map_err(|_| "Video response was interrupted")?
+                    {
+                        if cancel.load(Ordering::Relaxed) {
+                            return Err("Video loading cancelled".into());
+                        }
+                        if Instant::now() >= deadline {
+                            return Err("Video loading timed out".into());
+                        }
+                        if chunk.len() > max - bytes.len() {
+                            return Err("Video response exceeds the size limit".into());
+                        }
+                        bytes.extend_from_slice(&chunk);
+                    }
+                    Ok(bytes)
+                };
+                tokio::select! {
+                    biased;
+                    reason = interrupted => Err(reason.into()),
+                    result = receive => result,
                 }
-                Ok(bytes)
-            };
-            tokio::select! {
-                biased;
-                reason = interrupted => Err(reason.into()),
-                result = receive => result,
-            }
-        })
+            })
+        };
+        if tokio::runtime::Handle::try_current().is_ok() {
+            std::thread::scope(|scope| {
+                scope
+                    .spawn(execute)
+                    .join()
+                    .unwrap_or_else(|_| Err("Video networking failed".into()))
+            })
+        } else {
+            execute()
+        }
     }
 }
 
@@ -195,5 +207,19 @@ mod tests {
                 .unwrap_err(),
             "Video loading timed out"
         );
+    }
+
+    #[test]
+    fn macroscope_request_is_safe_inside_tokio_runtime() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            assert_eq!(
+                response(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc", 3).unwrap(),
+                b"abc"
+            );
+        });
     }
 }

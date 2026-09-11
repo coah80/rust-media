@@ -21,4 +21,4 @@ Validate UI changes on both `winit-software` and `winit-femtovg`. Offline CI cov
 
 Git consumption is supported. `publish = false` prevents accidental registry publication while the pinned Git-only script dependency remains. The registry has ytdlp-ejs 0.1.1, but its source differs from the tested Git revision; it is not a verified drop-in replacement. A crates.io release requires resolving that dependency, verifying the packaged archive and reviewing the public API. Do not remove the guard just to make publishing succeed.
 
-Before declaring stable playback, validate long real-time sessions, slow/disconnected networks, seek during buffering, audio device changes, audio/video sync and macOS/Linux playback. Record measurements and failures. No benchmark establishes flawless behavior for every input.
+Before expanding production support beyond the documented Windows contract, validate long real-time sessions, slow/disconnected networks, seek during buffering, audio device changes, audio/video sync and playback on the added platform. Record measurements and failures. No benchmark establishes flawless behavior for every input.

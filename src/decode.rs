@@ -135,13 +135,18 @@ impl<R: Read + Seek> Video<R> {
                 high = mid - 1;
             }
         }
-        while low > 1 {
+        loop {
             let sample = self
                 .reader
                 .read_sample(self.track, low)
                 .map_err(|_| "Could not seek video")?
                 .ok_or("Missing video sample")?;
-            if sample.is_sync {
+            let presentation =
+                (sample.start_time as f64 + f64::from(sample.rendering_offset)) / self.scale;
+            if sample.is_sync && (presentation <= seconds || low == 1) {
+                break;
+            }
+            if low == 1 {
                 break;
             }
             low -= 1;
@@ -207,6 +212,7 @@ struct FragmentSegment {
 struct FragmentPlan {
     segments: Vec<FragmentSegment>,
     timescale: u32,
+    origin: u64,
 }
 
 struct FragmentConfig {
@@ -218,6 +224,7 @@ struct FragmentConfig {
     default_duration: Option<u32>,
     default_size: Option<u32>,
     default_flags: Option<u32>,
+    offset: Option<u64>,
 }
 
 type SegmentBoxes = (Vec<(mp4::MoofBox, u64)>, Vec<Range<u64>>);
@@ -239,6 +246,8 @@ pub struct FragmentVideo<R> {
     segments: Vec<FragmentSegment>,
     segment: usize,
     segment_scale: f64,
+    segment_origin: f64,
+    offset: f64,
 }
 
 impl<R: Read + Seek> FragmentVideo<R> {
@@ -262,12 +271,21 @@ impl<R: Read + Seek> FragmentVideo<R> {
         let parsed = mp4::Mp4Reader::read_header(header_reader, header_end)
             .map_err(|_| "This video is not a supported fragmented MP4")?;
         let config = fragment_config(&parsed)?;
-        let duration = plan
+        let offset = config
+            .offset
+            .map_or(plan.origin as f64 / f64::from(plan.timescale), |value| {
+                value as f64 / config.scale
+            });
+        let end = plan
             .segments
             .last()
             .and_then(|segment| segment.start.checked_add(segment.duration))
             .ok_or("Invalid video segment duration")? as f64
             / f64::from(plan.timescale);
+        if end < offset {
+            return Err("Invalid video segment duration".into());
+        }
+        let duration = end - offset;
         let mut video = Self {
             reader,
             decoder: config.decoder,
@@ -285,6 +303,8 @@ impl<R: Read + Seek> FragmentVideo<R> {
             segments: plan.segments,
             segment: 0,
             segment_scale: f64::from(plan.timescale),
+            segment_origin: offset * f64::from(plan.timescale),
+            offset,
         };
         video.load_segment(0)?;
         Ok(video)
@@ -299,7 +319,8 @@ impl<R: Read + Seek> FragmentVideo<R> {
         }
         let config = fragment_config(&parsed)?;
         let mut samples = Vec::new();
-        let mut expected_time = 0u64;
+        let mut expected_time = None;
+        let mut first_time = None;
         for (moof, moof_offset) in parsed.moofs.iter().zip(moof_offsets) {
             let traf = moof
                 .trafs
@@ -313,10 +334,13 @@ impl<R: Read + Seek> FragmentVideo<R> {
             let mut time = traf
                 .tfdt
                 .as_ref()
-                .map_or(expected_time, |value| value.base_media_decode_time);
-            if time != expected_time {
+                .map(|value| value.base_media_decode_time)
+                .or(expected_time)
+                .unwrap_or(0);
+            if expected_time.is_some_and(|expected| time != expected) {
                 return Err("Video fragments are not contiguous".into());
             }
+            first_time.get_or_insert(time);
             let base = traf.tfhd.base_data_offset.unwrap_or(moof_offset);
             let mut position = base
                 .checked_add_signed(i64::from(
@@ -383,10 +407,15 @@ impl<R: Read + Seek> FragmentVideo<R> {
                     .checked_add(u64::from(duration))
                     .ok_or("Video timestamp overflow")?;
             }
-            expected_time = time;
+            expected_time = Some(time);
         }
         if samples.is_empty() {
             return Err("The video contains no samples".into());
+        }
+        let end = expected_time.ok_or("The video contains no samples")?;
+        let offset_ticks = config.offset.unwrap_or(first_time.unwrap_or(0));
+        if end < offset_ticks {
+            return Err("Invalid video duration".into());
         }
         Ok(Self {
             reader,
@@ -397,7 +426,7 @@ impl<R: Read + Seek> FragmentVideo<R> {
             scale: config.scale,
             next: 0,
             pending: Vec::new(),
-            duration: expected_time as f64 / config.scale,
+            duration: (end - offset_ticks) as f64 / config.scale,
             track: config.track,
             default_duration: config.default_duration,
             default_size: config.default_size,
@@ -405,6 +434,8 @@ impl<R: Read + Seek> FragmentVideo<R> {
             segments: Vec::new(),
             segment: 0,
             segment_scale: config.scale,
+            segment_origin: 0.,
+            offset: offset_ticks as f64 / config.scale,
         })
     }
 
@@ -423,6 +454,7 @@ impl<R: Read + Seek> FragmentVideo<R> {
             if run.sample_count > 100_000 {
                 return Err("Video fragment exceeds the sample limit".into());
             }
+            ensure_fragment_sample_limit(samples.len(), run.sample_count as usize)?;
             let mut time = traf
                 .tfdt
                 .as_ref()
@@ -508,7 +540,7 @@ impl<R: Read + Seek> FragmentVideo<R> {
 
     fn seek(&mut self, seconds: f64) -> Result<(), String> {
         if !self.segments.is_empty() {
-            let target = seconds.max(0.) * self.segment_scale;
+            let target = seconds.max(0.) * self.segment_scale + self.segment_origin;
             let segment = self
                 .segments
                 .iter()
@@ -520,7 +552,7 @@ impl<R: Read + Seek> FragmentVideo<R> {
                 .saturating_sub(1);
             self.load_segment(segment)?;
         }
-        let target = seconds.max(0.) * self.scale;
+        let target = (seconds.max(0.) + self.offset) * self.scale;
         let next = self
             .samples
             .iter()
@@ -555,7 +587,8 @@ impl<R: Read + Seek> FragmentVideo<R> {
                 .and_then(|_| self.reader.read_exact(&mut bytes))
                 .map_err(|_| "Could not read video")?;
             self.next += 1;
-            let time = (sample.start as f64 + f64::from(sample.rendering_offset)) / self.scale;
+            let time = (sample.start as f64 + f64::from(sample.rendering_offset)) / self.scale
+                - self.offset;
             let (packet, idr) = annex_b(&bytes, self.length)?;
             if idr {
                 self.decoder = Decoder::new();
@@ -670,6 +703,32 @@ fn fragment_config<R: Read + Seek>(parsed: &mp4::Mp4Reader<R>) -> Result<Fragmen
         .as_ref()
         .map(|mvex| &mvex.trex)
         .filter(|trex| trex.track_id == track_id);
+    let offset = if let Some(edits) = track
+        .trak
+        .edts
+        .as_ref()
+        .and_then(|edits| edits.elst.as_ref())
+    {
+        if edits.entries.len() > 1 {
+            return Err("Multiple video edit segments are not supported yet".into());
+        }
+        edits
+            .entries
+            .first()
+            .map(|edit| {
+                if edit.media_rate != 1
+                    || edit.media_rate_fraction != 0
+                    || edit.media_time > i64::MAX as u64
+                {
+                    Err::<u64, String>("This video edit is not supported yet".into())
+                } else {
+                    Ok(edit.media_time)
+                }
+            })
+            .transpose()?
+    } else {
+        None
+    };
     Ok(FragmentConfig {
         decoder,
         header,
@@ -679,6 +738,7 @@ fn fragment_config<R: Read + Seek>(parsed: &mp4::Mp4Reader<R>) -> Result<Fragmen
         default_duration: trex.map(|value| value.default_sample_duration),
         default_size: trex.map(|value| value.default_sample_size),
         default_flags: trex.map(|value| value.default_sample_flags),
+        offset,
     })
 }
 
@@ -687,7 +747,12 @@ fn fragment_plan<R: Read + Seek>(
     size: u64,
 ) -> Result<Option<FragmentPlan>, String> {
     let mut offset = 0u64;
+    let mut boxes = 0usize;
     while offset < size {
+        boxes += 1;
+        if boxes > 100_000 {
+            return Err("Video exceeds the box limit".into());
+        }
         reader
             .seek(SeekFrom::Start(offset))
             .map_err(|_| "Could not seek video initialization")?;
@@ -759,6 +824,7 @@ fn fragment_plan<R: Read + Seek>(
         return Ok(Some(FragmentPlan {
             segments,
             timescale,
+            origin: earliest,
         }));
     }
     Ok(None)
@@ -771,7 +837,12 @@ fn segment_boxes<R: Read + Seek>(
     let mut offset = range.start;
     let mut moofs = Vec::new();
     let mut mdats = Vec::new();
+    let mut boxes = 0usize;
     while offset < range.end {
+        boxes += 1;
+        if boxes > 100_000 {
+            return Err("Video segment exceeds the box limit".into());
+        }
         reader
             .seek(SeekFrom::Start(offset))
             .map_err(|_| "Could not seek video segment")?;
@@ -781,6 +852,10 @@ fn segment_boxes<R: Read + Seek>(
                 if reader.stream_position().ok() != Some(offset + 8) {
                     return Err("Unsupported extended video fragment".into());
                 }
+                validate_fragment_runs(reader, offset + 8, end)?;
+                reader
+                    .seek(SeekFrom::Start(offset + 8))
+                    .map_err(|_| "Could not seek video fragment")?;
                 let moof = mp4::MoofBox::read_box(reader, payload + 8)
                     .map_err(|_| "Could not parse video fragment")?;
                 moofs.push((moof, offset));
@@ -845,7 +920,12 @@ fn top_level_boxes<R: Read + Seek>(
     let mut offset = 0u64;
     let mut moofs = Vec::new();
     let mut mdats = Vec::new();
+    let mut boxes = 0usize;
     while offset < size {
+        boxes += 1;
+        if boxes > 100_000 {
+            return Err("Video exceeds the box limit".into());
+        }
         reader
             .seek(SeekFrom::Start(offset))
             .map_err(|_| "Could not seek video fragments")?;
@@ -872,13 +952,72 @@ fn top_level_boxes<R: Read + Seek>(
             .filter(|end| box_size >= header_size && *end <= size)
             .ok_or("Invalid video fragment box")?;
         match &header[4..8] {
-            b"moof" => moofs.push(offset),
+            b"moof" => {
+                validate_fragment_runs(reader, offset + header_size, end)?;
+                moofs.push(offset);
+            }
             b"mdat" => mdats.push(offset + header_size..end),
             _ => {}
         }
         offset = end;
     }
     Ok((moofs, mdats))
+}
+
+fn ensure_fragment_sample_limit(current: usize, additional: usize) -> Result<(), String> {
+    if current
+        .checked_add(additional)
+        .is_none_or(|total| total > 1_000_000)
+    {
+        Err("Video exceeds the sample limit".into())
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn validate_fragment_runs<R: Read + Seek>(
+    reader: &mut R,
+    start: u64,
+    end: u64,
+) -> Result<(), String> {
+    let mut child = start;
+    let mut boxes = 0usize;
+    while child < end {
+        boxes += 1;
+        if boxes > 100_000 {
+            return Err("Video fragment exceeds the box limit".into());
+        }
+        reader
+            .seek(SeekFrom::Start(child))
+            .map_err(|_| "Could not seek video fragment")?;
+        let (kind, _, child_end) = box_header(reader, child, end)?;
+        let payload_start = reader
+            .stream_position()
+            .map_err(|_| "Could not read video fragment")?;
+        if &kind == b"traf" {
+            let mut nested = payload_start;
+            let mut runs = 0usize;
+            while nested < child_end {
+                boxes += 1;
+                if boxes > 100_000 {
+                    return Err("Video fragment exceeds the box limit".into());
+                }
+                reader
+                    .seek(SeekFrom::Start(nested))
+                    .map_err(|_| "Could not seek video fragment")?;
+                let (nested_kind, _, nested_end) = box_header(reader, nested, child_end)?;
+                if &nested_kind == b"trun" {
+                    runs += 1;
+                    if runs > 1 {
+                        return Err("Multiple video fragment runs are not supported".into());
+                    }
+                }
+                nested = nested_end;
+            }
+        }
+        child = child_end;
+    }
+    Ok(())
 }
 
 fn annex_b(bytes: &[u8], length: usize) -> Result<(Vec<u8>, bool), String> {
@@ -942,4 +1081,18 @@ fn pixels(frame: rusty_h264_common::types::YuvFrame) -> Result<Pixels, String> {
         width,
         height,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn macroscope_aggregate_fragment_sample_limit() {
+        assert!(ensure_fragment_sample_limit(900_000, 100_000).is_ok());
+        assert_eq!(
+            ensure_fragment_sample_limit(900_001, 100_000).unwrap_err(),
+            "Video exceeds the sample limit"
+        );
+    }
 }

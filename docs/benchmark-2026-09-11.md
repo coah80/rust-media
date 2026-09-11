@@ -2,6 +2,18 @@
 
 Release builds on Windows x64, AMD Ryzen 7 9800X3D. Measurements use Windows process memory counters sampled every 100 ms. Working set is resident process memory; private bytes are committed private memory. Neither includes all GPU memory. Live network timings include resolution and initial media reads. Concurrent builds and probes affected some full-decode timings, so they are correctness and memory checks, not controlled throughput comparisons.
 
+## Production-readiness rerun
+
+The final review run added 18 focused regressions covering all 17 Macroscope findings. They cover parser limits, aggregate fragment limits, multiple-run rejection, nonzero indexed timelines, edit lists, sparse-frame probing, split UMP parts, bounded context policies, reserved framing bytes, cancellation during stalled bodies and retries, provider error selection and Tokio runtime reentry.
+
+The full suite passed 51 checks with native features. A separate stress test passed 100 fresh decoder open/seek cycles, 20 repeated complete ordinary decodes and 25 repeated complete fragmented decodes with exact presentation timestamps and RGBA checksums. This run found and fixed a B-frame seek boundary that the smaller seek test missed.
+
+Twelve fresh-process YouTube startup probes covered the same four videos three times each. Every video retained its checksum. First-frame time ranged from 1.000 to 1.780 seconds. A current complete Sintel run decoded 21,313 frames and 78,329,856 AAC samples through 888.000 seconds in 192.293 seconds. Its checksum remained `4f336c142cea91b5`, resident memory stayed roughly 140-153 MiB during the run and peaked at 163.4 MiB. A current complete `Gf-fCJ6TkRU` run decoded 4,159 frames and 15,290,368 AAC samples through 173.250 seconds in 46.298 seconds with checksum `bec25ce2bd6e2572`; peak resident/private memory was 110.5/99.6 MiB.
+
+Two public FixupX videos completed through video and audio with 464 and 908 frames. Their repeated 60-frame probes kept the same checksums. A clean external consumer built the default library without Slint and ran the real zero-volume `Player` pipeline to completion for a 192-frame local file and the 464-frame FixupX video.
+
+The reviewed Windows release executable SHA-256 is `fd0f80abc291d9233ce566996a4aadcc81bfc90e99844e8c8640c8946b17bbd5`.
+
 ## Problems found and fixes
 
 The decoder's optional `global-alloc` feature installed its allocator across the entire application. On the same local 90-frame 720p clip, removing that feature reduced peak working set from 129.5 to 84.8 MiB and private bytes from 1029.8 to 74.4 MiB. Decode times were 0.959 and 0.981 seconds, with identical checksum `aa7c17764dfb791d`. Rust's normal platform allocator is now used.

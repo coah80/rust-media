@@ -1,6 +1,6 @@
 # YouTube support and limits
 
-The experimental adapter plays supported public YouTube clips through signed H.264/AAC media and retains SABR as a fallback. Provider behavior can change. The current adapter uses an anonymous VisionOS client profile; it is not an official YouTube embedding SDK.
+The provider adapter plays supported public YouTube clips through signed H.264/AAC media and retains SABR as a fallback. Provider behavior can change. The current adapter uses an anonymous VisionOS client profile; it is not an official YouTube embedding SDK.
 
 ## Implemented path
 

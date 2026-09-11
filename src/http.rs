@@ -86,11 +86,12 @@ pub struct RemoteFile {
     start: u64,
     bytes: Arc<[u8]>,
     cache: Option<Arc<Cache>>,
+    max_size: u64,
 }
 
 impl RemoteFile {
     pub fn open(url: &str, cancel: Arc<AtomicBool>) -> Result<Self, String> {
-        Self::open_inner(url, cancel, None)
+        Self::open_inner(url, cancel, None, MAX_SIZE)
     }
 
     pub fn open_progressive(
@@ -98,12 +99,11 @@ impl RemoteFile {
         cancel: Arc<AtomicBool>,
         max_size: u64,
     ) -> Result<Self, String> {
-        let cache = Arc::new(Cache::default());
-        let file = Self::open_inner(url, cancel, Some(cache))?;
-        if file.size > max_size {
-            return Err("Video exceeds the progressive loading limit".into());
+        if max_size == 0 || max_size > MAX_SIZE {
+            return Err("Invalid progressive loading limit".into());
         }
-        Ok(file)
+        let cache = Arc::new(Cache::default());
+        Self::open_inner(url, cancel, Some(cache), max_size)
     }
 
     pub fn start_prefetch(&self) {
@@ -123,6 +123,7 @@ impl RemoteFile {
         url: &str,
         cancel: Arc<AtomicBool>,
         cache: Option<Arc<Cache>>,
+        max_size: u64,
     ) -> Result<Self, String> {
         if !allowed(url) {
             return Err("Unsupported video address".into());
@@ -142,6 +143,7 @@ impl RemoteFile {
             start: 0,
             bytes: Arc::from([]),
             cache,
+            max_size,
         };
         file.load(0)
             .map_err(|_| "Video unavailable. Retry or open the original link")?;
@@ -163,50 +165,39 @@ impl RemoteFile {
             return Ok(());
         }
         let end = start.saturating_add(BLOCK - 1).min(if self.size == 0 {
-            MAX_SIZE
+            self.max_size - 1
         } else {
             self.size - 1
         });
-        let mut failure = None;
-        for attempt in 0..3 {
-            match self.request_block(start, end) {
-                Ok((actual_start, size, bytes)) => {
-                    if size == 0 || size > MAX_SIZE || (self.size != 0 && self.size != size) {
-                        return Err(io::ErrorKind::InvalidData.into());
-                    }
-                    let bytes: Arc<[u8]> = bytes.into();
-                    if let Some(cache) = &self.cache {
-                        cache.store(actual_start, bytes.clone(), size);
-                    }
-                    self.size = size;
-                    self.start = actual_start;
-                    self.bytes = bytes;
-                    return Ok(());
-                }
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        io::ErrorKind::Other
-                            | io::ErrorKind::UnexpectedEof
-                            | io::ErrorKind::TimedOut
-                            | io::ErrorKind::ConnectionAborted
-                            | io::ErrorKind::ConnectionReset
-                            | io::ErrorKind::BrokenPipe
-                    ) =>
-                {
-                    failure = Some(error);
-                    std::thread::sleep(Duration::from_millis(50 * (attempt + 1)));
-                }
-                Err(error) => return Err(error),
-            }
+        let (actual_start, size, bytes) =
+            retry_request(&self.cancel, || self.request_block(start, end))?;
+        if size == 0 || size > self.max_size || (self.size != 0 && self.size != size) {
+            return Err(io::ErrorKind::InvalidData.into());
         }
-        Err(failure.unwrap_or_else(|| io::Error::other("Video range request failed")))
+        let bytes: Arc<[u8]> = bytes.into();
+        if let Some(cache) = &self.cache {
+            cache.store(actual_start, bytes.clone(), size);
+        }
+        self.size = size;
+        self.start = actual_start;
+        self.bytes = bytes;
+        Ok(())
     }
 
     fn request_block(&self, start: u64, end: u64) -> io::Result<(u64, u64, Vec<u8>)> {
-        let mut url = self.url.clone();
-        for _ in 0..5 {
-            if !allowed(&url) {
+        self.request_block_from(&self.url, start, end, false)
+    }
+
+    fn request_block_from(
+        &self,
+        initial_url: &str,
+        start: u64,
+        end: u64,
+        allow_initial: bool,
+    ) -> io::Result<(u64, u64, Vec<u8>)> {
+        let mut url = initial_url.to_owned();
+        for redirect in 0..5 {
+            if (!allow_initial || redirect > 0) && !allowed(&url) {
                 return Err(io::ErrorKind::PermissionDenied.into());
             }
             let response = self
@@ -256,18 +247,19 @@ impl RemoteFile {
                 if first != start || last < first || last > end || last >= total {
                     return Err(io::ErrorKind::InvalidData.into());
                 }
+                enforce_size_limit(total, self.max_size)?;
                 (first, total, last - first + 1)
             } else {
                 let size = response
                     .content_length()
                     .ok_or(io::ErrorKind::InvalidData)?;
+                enforce_size_limit(size, self.max_size)?;
                 if size > 32 * 1024 * 1024 {
                     return Err(io::Error::other("Server does not support video seeking"));
                 }
                 (0, size, size)
             };
-            let mut bytes = Vec::new();
-            response.take(limit + 1).read_to_end(&mut bytes)?;
+            let bytes = read_body(response, limit + 1, &self.cancel)?;
             if bytes.len() as u64 != limit || self.cancel.load(Ordering::Relaxed) {
                 return Err(io::ErrorKind::UnexpectedEof.into());
             }
@@ -275,6 +267,77 @@ impl RemoteFile {
         }
         Err(io::Error::other("Too many video redirects"))
     }
+}
+
+fn read_body(
+    response: reqwest::blocking::Response,
+    limit: u64,
+    cancel: &AtomicBool,
+) -> io::Result<Vec<u8>> {
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let result = response.take(limit).read_to_end(&mut bytes).map(|_| bytes);
+        let _ = sender.send(result);
+    });
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        match receiver.recv_timeout(Duration::from_millis(25)) {
+            Ok(result) => return result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(io::Error::other("Video response reader stopped"));
+            }
+        }
+    }
+}
+
+fn enforce_size_limit(size: u64, max_size: u64) -> io::Result<()> {
+    if size == 0 || size > max_size {
+        Err(io::ErrorKind::InvalidData.into())
+    } else {
+        Ok(())
+    }
+}
+
+fn retry_request<T>(
+    cancel: &AtomicBool,
+    mut request: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    let mut failure = None;
+    for attempt in 0..3 {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        match request() {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::Other
+                        | io::ErrorKind::UnexpectedEof
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::BrokenPipe
+                ) =>
+            {
+                failure = Some(error);
+                let wait = Duration::from_millis(50 * (attempt + 1));
+                let began = std::time::Instant::now();
+                while began.elapsed() < wait {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err(io::ErrorKind::Interrupted.into());
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(failure.unwrap_or_else(|| io::Error::other("Video range request failed")))
 }
 
 impl Read for RemoteFile {
@@ -347,5 +410,86 @@ mod tests {
         ] {
             assert!(!super::allowed(url));
         }
+    }
+
+    #[test]
+    fn macroscope_progressive_size_limit_is_checked_before_body() {
+        assert!(enforce_size_limit(1024, 1024).is_ok());
+        assert_eq!(
+            enforce_size_limit(1025, 1024).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn macroscope_cancellation_stops_transient_retries() {
+        let cancel = AtomicBool::new(false);
+        let mut calls = 0;
+        let error = retry_request(&cancel, || {
+            calls += 1;
+            cancel.store(true, Ordering::Relaxed);
+            Err::<(), _>(io::ErrorKind::TimedOut.into())
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn macroscope_stalled_range_body_cancels_promptly() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            sync::{Arc, mpsc},
+            time::Instant,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (started_tx, started_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                socket.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 206 Partial Content\r\nContent-Length: 4\r\nContent-Range: bytes 0-3/4\r\n\r\nx",
+                )
+                .unwrap();
+            started_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_secs(2));
+        });
+        let cancel = Arc::new(AtomicBool::new(false));
+        let file = RemoteFile {
+            client: reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(15))
+                .build()
+                .unwrap(),
+            url: url.clone(),
+            cancel: cancel.clone(),
+            position: 0,
+            size: 0,
+            start: 0,
+            bytes: Arc::from([]),
+            cache: None,
+            max_size: 4,
+        };
+        let worker_cancel = cancel.clone();
+        let worker_url = url.clone();
+        let worker = std::thread::spawn(move || {
+            retry_request(&worker_cancel, || {
+                file.request_block_from(&worker_url, 0, 3, true)
+            })
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let began = Instant::now();
+        cancel.store(true, Ordering::Relaxed);
+        let error = worker.join().unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(began.elapsed() < Duration::from_millis(500));
+        server.join().unwrap();
     }
 }

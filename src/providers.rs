@@ -357,11 +357,7 @@ fn parse_youtube(player: &Value) -> Result<Resolved, String> {
             continue;
         }
         let mime = format["mimeType"].as_str().unwrap_or_default();
-        if mime.starts_with("video/mp4")
-            && mime.contains("avc1")
-            && format["height"].as_u64().unwrap_or(0) <= 720
-            && format["fps"].as_u64().unwrap_or(30) <= 30
-        {
+        if is_h264_candidate(format) {
             if video.is_none_or(|previous| format["height"].as_u64() > previous["height"].as_u64())
             {
                 video = Some(format);
@@ -402,6 +398,14 @@ fn parse_youtube(player: &Value) -> Result<Resolved, String> {
     })
 }
 
+fn is_h264_candidate(format: &Value) -> bool {
+    let mime = format["mimeType"].as_str().unwrap_or_default();
+    mime.starts_with("video/mp4")
+        && mime.contains("avc1")
+        && format["height"].as_u64().unwrap_or(0) <= 720
+        && format["fps"].as_u64().unwrap_or(30) <= 30
+}
+
 fn youtube_stream_error(data: &Value) -> &'static str {
     let formats = ["formats", "adaptiveFormats"]
         .iter()
@@ -409,6 +413,9 @@ fn youtube_stream_error(data: &Value) -> &'static str {
     let mut direct = false;
     let mut cipher = false;
     for format in formats {
+        if !is_h264_candidate(format) {
+            continue;
+        }
         direct |= format["url"].is_string();
         cipher |= format["signatureCipher"].is_string() || format["cipher"].is_string();
     }
@@ -440,6 +447,35 @@ mod tests {
         assert!(output.contains("YouTube"));
         assert!(!output.contains("private-"));
         assert!(!output.contains("https://"));
+    }
+
+    #[test]
+    fn macroscope_ciphered_h264_reports_signature_resolution() {
+        let player = serde_json::json!({
+            "playabilityStatus": {"status": "OK"},
+            "streamingData": {
+                "adaptiveFormats": [
+                    {
+                        "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"",
+                        "url": "https://rr1.googlevideo.com/audio"
+                    },
+                    {
+                        "mimeType": "video/webm; codecs=\"vp9\"",
+                        "url": "https://rr1.googlevideo.com/video"
+                    },
+                    {
+                        "mimeType": "video/mp4; codecs=\"avc1.4d401f\"",
+                        "height": 720,
+                        "fps": 30,
+                        "signatureCipher": "s=encrypted"
+                    }
+                ]
+            }
+        });
+        assert_eq!(
+            parse_youtube(&player).unwrap_err(),
+            "This YouTube stream needs URL signature resolution, which is not supported yet"
+        );
     }
     fn stalled_request_cancels(body_started: bool) {
         use std::{
@@ -490,12 +526,12 @@ mod tests {
     }
 
     #[test]
-    fn stalled_provider_headers_cancel_promptly() {
+    fn macroscope_stalled_provider_headers_cancel_promptly() {
         stalled_request_cancels(false);
     }
 
     #[test]
-    fn stalled_provider_body_cancels_promptly() {
+    fn macroscope_stalled_provider_body_cancels_promptly() {
         stalled_request_cancels(true);
     }
 

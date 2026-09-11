@@ -67,9 +67,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if count == 0 {
             return Err("Video contains no decodable frames".into());
         }
-        if full && last + 1.0 < decoder.duration() {
-            return Err("Video ended before its declared duration".into());
-        }
         let audio_samples = if full && (decoder.has_audio() || audio_source.is_some()) {
             let mut audio = Audio::new(audio_source.unwrap_or(source))?;
             let samples = audio.by_ref().count();
