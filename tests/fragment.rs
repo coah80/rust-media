@@ -395,6 +395,64 @@ fn prepend_foreign_sidx(bytes: &[u8]) -> Vec<u8> {
     output
 }
 
+fn split_video_sidx(bytes: &[u8]) -> Vec<u8> {
+    let kind = bytes.windows(4).position(|value| value == b"sidx").unwrap();
+    let start = kind - 4;
+    let size = u32::from_be_bytes(bytes[start..start + 4].try_into().unwrap()) as usize;
+    assert_eq!(bytes[start + 8], 0);
+    let reference_id = u32::from_be_bytes(bytes[start + 12..start + 16].try_into().unwrap());
+    let timescale = u32::from_be_bytes(bytes[start + 16..start + 20].try_into().unwrap());
+    let earliest = u32::from_be_bytes(bytes[start + 20..start + 24].try_into().unwrap());
+    let first_offset = u32::from_be_bytes(bytes[start + 24..start + 28].try_into().unwrap());
+    let count = u16::from_be_bytes(bytes[start + 30..start + 32].try_into().unwrap()) as usize;
+    let split = count / 2;
+    assert!(split > 0 && split < count);
+    let entries = &bytes[start + 32..start + size];
+    let first_length: u32 = entries[..split * 12]
+        .as_chunks::<12>()
+        .0
+        .iter()
+        .map(|entry| u32::from_be_bytes(entry[..4].try_into().unwrap()) & 0x7fff_ffff)
+        .sum();
+    let first_duration: u32 = entries[..split * 12]
+        .as_chunks::<12>()
+        .0
+        .iter()
+        .map(|entry| u32::from_be_bytes(entry[4..8].try_into().unwrap()))
+        .sum();
+    let second_size = 32 + (count - split) * 12;
+    let index = |entries: &[u8], earliest: u32, first_offset: u32| {
+        let mut index = Vec::with_capacity(32 + entries.len());
+        index.extend_from_slice(&((32 + entries.len()) as u32).to_be_bytes());
+        index.extend_from_slice(b"sidx");
+        index.extend_from_slice(&[0; 4]);
+        index.extend_from_slice(&reference_id.to_be_bytes());
+        index.extend_from_slice(&timescale.to_be_bytes());
+        index.extend_from_slice(&earliest.to_be_bytes());
+        index.extend_from_slice(&first_offset.to_be_bytes());
+        index.extend_from_slice(&0u16.to_be_bytes());
+        index.extend_from_slice(&((entries.len() / 12) as u16).to_be_bytes());
+        index.extend_from_slice(entries);
+        index
+    };
+    let first = index(
+        &entries[..split * 12],
+        earliest,
+        first_offset + second_size as u32,
+    );
+    let second = index(
+        &entries[split * 12..],
+        earliest + first_duration,
+        first_offset + first_length,
+    );
+    let mut output = Vec::with_capacity(bytes.len() + 32);
+    output.extend_from_slice(&bytes[..start]);
+    output.extend_from_slice(&first);
+    output.extend_from_slice(&second);
+    output.extend_from_slice(&bytes[start + size..]);
+    output
+}
+
 #[test]
 fn fragment_offsets_preserve_every_decoded_frame() {
     let fragmented = include_bytes!("fixtures/fragmented.mp4");
@@ -530,6 +588,21 @@ fn indexed_fragments_start_without_later_segments_and_seek() {
     };
     assert_eq!(expected.0, actual.0);
     assert_eq!(expected.1.rgba, actual.1.rgba);
+}
+
+#[test]
+fn macroscope_multiple_video_indexes_are_merged() {
+    let (bytes, _) = indexed_fixture();
+    let bytes = split_video_sidx(&bytes);
+    let mut video =
+        MediaVideo::fragmented(Cursor::new(&bytes), Cursor::new(&bytes), bytes.len() as u64)
+            .unwrap();
+    assert!((video.duration() - 2.).abs() < 0.001);
+    let mut frames = 0;
+    while video.frame().unwrap().is_some() {
+        frames += 1;
+    }
+    assert_eq!(frames, 48);
 }
 
 #[test]

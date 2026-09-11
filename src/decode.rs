@@ -296,13 +296,43 @@ impl<R: Read + Seek> FragmentVideo<R> {
         let parsed = mp4::Mp4Reader::read_header(&mut header_reader, header_end)
             .map_err(|_| "This video is not a supported fragmented MP4")?;
         let config = fragment_config(&parsed, defaults)?;
-        let Some(plan) = plans.into_iter().find(|plan| plan.track == config.track) else {
+        let mut matching: Vec<_> = plans
+            .into_iter()
+            .filter(|plan| plan.track == config.track)
+            .collect();
+        if matching.is_empty() {
             drop(parsed);
             header_reader
                 .seek(SeekFrom::Start(0))
                 .map_err(|_| "Could not seek video initialization")?;
             return Self::new_eager(reader, header_reader, size);
-        };
+        }
+        matching.sort_by_key(|plan| {
+            plan.segments
+                .first()
+                .map_or(u64::MAX, |segment| segment.range.start)
+        });
+        let mut plan = matching.remove(0);
+        for next in matching {
+            let previous = plan
+                .segments
+                .last()
+                .ok_or("The video contains no media segments")?;
+            let following = next
+                .segments
+                .first()
+                .ok_or("The video contains no media segments")?;
+            if next.timescale != plan.timescale
+                || previous.range.end > following.range.start
+                || previous
+                    .start
+                    .checked_add(previous.duration)
+                    .is_none_or(|end| end != following.start)
+            {
+                return Err("Video segment indexes are not contiguous".into());
+            }
+            plan.segments.extend(next.segments);
+        }
         let offset = config
             .offset
             .map_or(plan.origin as f64 / f64::from(plan.timescale), |value| {
@@ -920,6 +950,7 @@ fn fragment_config<R: Read + Seek>(
 fn fragment_plans<R: Read + Seek>(reader: &mut R, size: u64) -> Result<Vec<FragmentPlan>, String> {
     let mut offset = 0u64;
     let mut boxes = 0usize;
+    let mut segments_count = 0usize;
     let mut plans = Vec::new();
     while offset < size {
         boxes += 1;
@@ -967,6 +998,8 @@ fn fragment_plans<R: Read + Seek>(reader: &mut R, size: u64) -> Result<Vec<Fragm
         if count == 0 || count > 10_000 || expected > payload {
             return Err("Invalid video segment index".into());
         }
+        ensure_fragment_segment_limit(segments_count, count)?;
+        segments_count += count;
         let mut position = end
             .checked_add(first_offset)
             .ok_or("Invalid video segment offset")?;
@@ -1004,6 +1037,17 @@ fn fragment_plans<R: Read + Seek>(reader: &mut R, size: u64) -> Result<Vec<Fragm
         offset = end;
     }
     Ok(plans)
+}
+
+fn ensure_fragment_segment_limit(current: usize, additional: usize) -> Result<(), String> {
+    if current
+        .checked_add(additional)
+        .is_none_or(|total| total > 100_000)
+    {
+        Err("Video exceeds the segment limit".into())
+    } else {
+        Ok(())
+    }
 }
 
 fn segment_boxes<R: Read + Seek>(
@@ -1276,6 +1320,15 @@ mod tests {
         assert_eq!(
             ensure_fragment_sample_limit(900_001, 100_000).unwrap_err(),
             "Video exceeds the sample limit"
+        );
+    }
+
+    #[test]
+    fn macroscope_aggregate_fragment_segment_limit() {
+        assert!(ensure_fragment_segment_limit(90_000, 10_000).is_ok());
+        assert_eq!(
+            ensure_fragment_segment_limit(90_001, 10_000).unwrap_err(),
+            "Video exceeds the segment limit"
         );
     }
 
