@@ -390,12 +390,14 @@ impl<R: Read + Seek> FragmentVideo<R> {
         let mut expected_time = None;
         let mut first_time = None;
         for (moof, moof_offset) in parsed.moofs.iter().zip(moof_offsets) {
-            let (traf_index, traf) = moof
+            let Some((traf_index, traf)) = moof
                 .trafs
                 .iter()
                 .enumerate()
                 .find(|(_, traf)| traf.tfhd.track_id == config.track)
-                .ok_or("Missing video fragment track")?;
+            else {
+                continue;
+            };
             let run = traf.trun.as_ref().ok_or("Missing video fragment run")?;
             if run.sample_count > 100_000 {
                 return Err("Video fragment exceeds the sample limit".into());
@@ -512,12 +514,14 @@ impl<R: Read + Seek> FragmentVideo<R> {
         let mut samples = Vec::new();
         let mut expected_time = None;
         for (moof, moof_offset) in moofs {
-            let (traf_index, traf) = moof
+            let Some((traf_index, traf)) = moof
                 .trafs
                 .iter()
                 .enumerate()
                 .find(|(_, traf)| traf.tfhd.track_id == self.track)
-                .ok_or("Missing video fragment track")?;
+            else {
+                continue;
+            };
             let run = traf.trun.as_ref().ok_or("Missing video fragment run")?;
             if run.sample_count > 100_000 {
                 return Err("Video fragment exceeds the sample limit".into());

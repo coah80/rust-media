@@ -382,6 +382,63 @@ fn multiplex_eager_fragments(bytes: &[u8]) -> Vec<u8> {
     output
 }
 
+fn prepend_audio_only_fragment(bytes: &[u8]) -> Vec<u8> {
+    let mut moof_start = 0usize;
+    loop {
+        let size =
+            u32::from_be_bytes(bytes[moof_start..moof_start + 4].try_into().unwrap()) as usize;
+        if &bytes[moof_start + 4..moof_start + 8] == b"moof" {
+            break;
+        }
+        moof_start += size;
+    }
+    let moof_size =
+        u32::from_be_bytes(bytes[moof_start..moof_start + 4].try_into().unwrap()) as usize;
+    let mdat_start = moof_start + moof_size;
+    let mdat_size =
+        u32::from_be_bytes(bytes[mdat_start..mdat_start + 4].try_into().unwrap()) as usize;
+    let first_traf = bytes[moof_start..mdat_start]
+        .windows(4)
+        .position(|value| value == b"traf")
+        .map(|position| position - 4)
+        .unwrap();
+    let first_traf_size = u32::from_be_bytes(
+        bytes[moof_start + first_traf..moof_start + first_traf + 4]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let second_traf = bytes[moof_start + first_traf + first_traf_size..mdat_start]
+        .windows(4)
+        .position(|value| value == b"traf")
+        .map(|position| first_traf + first_traf_size + position - 4)
+        .unwrap();
+    let second_traf_size = u32::from_be_bytes(
+        bytes[moof_start + second_traf..moof_start + second_traf + 4]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let mut moof = bytes[moof_start..mdat_start].to_vec();
+    moof.drain(second_traf..second_traf + second_traf_size);
+    let new_moof_size = moof.len();
+    moof[..4].copy_from_slice(&(new_moof_size as u32).to_be_bytes());
+    let trun = moof[first_traf..first_traf + first_traf_size]
+        .windows(4)
+        .position(|value| value == b"trun")
+        .map(|position| first_traf + position)
+        .unwrap();
+    moof[trun + 12..trun + 16].copy_from_slice(&((new_moof_size + 8) as i32).to_be_bytes());
+    let payload = &bytes[mdat_start + 8..mdat_start + mdat_size];
+    let audio = &payload[..payload.len() / 2];
+    let mut output = Vec::with_capacity(bytes.len() + moof.len() + audio.len() + 8);
+    output.extend_from_slice(&bytes[..moof_start]);
+    output.extend_from_slice(&moof);
+    output.extend_from_slice(&((audio.len() + 8) as u32).to_be_bytes());
+    output.extend_from_slice(b"mdat");
+    output.extend_from_slice(audio);
+    output.extend_from_slice(&bytes[moof_start..]);
+    output
+}
+
 fn prepend_foreign_sidx(bytes: &[u8]) -> Vec<u8> {
     let kind = bytes.windows(4).position(|value| value == b"sidx").unwrap();
     let start = kind - 4;
@@ -490,6 +547,34 @@ fn fragmented_video_decodes_without_full_remux() {
 fn macroscope_eager_fragments_follow_preceding_traf() {
     let source = include_bytes!("fixtures/fragmented.mp4");
     let multiplexed = multiplex_eager_fragments(source);
+    let mut expected = MediaVideo::fragmented(
+        Cursor::new(source),
+        Cursor::new(source),
+        source.len() as u64,
+    )
+    .unwrap();
+    let mut actual = MediaVideo::fragmented(
+        Cursor::new(&multiplexed),
+        Cursor::new(&multiplexed),
+        multiplexed.len() as u64,
+    )
+    .unwrap();
+    let mut frames = 0;
+    while let Some(expected) = expected.frame().unwrap() {
+        let actual = actual.frame().unwrap().unwrap();
+        assert_eq!(actual.0, expected.0);
+        assert_eq!(actual.1.rgba, expected.1.rgba);
+        frames += 1;
+    }
+    assert_eq!(frames, 48);
+    assert!(actual.frame().unwrap().is_none());
+}
+
+#[test]
+fn macroscope_eager_skips_audio_only_fragments() {
+    let source = include_bytes!("fixtures/fragmented.mp4");
+    let multiplexed = multiplex_eager_fragments(source);
+    let multiplexed = prepend_audio_only_fragment(&multiplexed);
     let mut expected = MediaVideo::fragmented(
         Cursor::new(source),
         Cursor::new(source),
