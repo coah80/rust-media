@@ -12,6 +12,7 @@ impl Client {
     pub fn new() -> Result<Self, String> {
         reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .cookie_store(true)
             .connect_timeout(Duration::from_secs(8))
             .timeout(Duration::from_secs(20))
             .user_agent("rust-media/0.1")

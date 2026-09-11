@@ -1,4 +1,5 @@
 use serde_json::Value;
+use std::io::Read;
 use std::sync::{Arc, atomic::AtomicBool};
 use std::time::{Duration, Instant};
 
@@ -153,9 +154,18 @@ fn youtube_id(url: &reqwest::Url) -> Option<String> {
 }
 
 fn youtube(id: &str, cancel: Arc<AtomicBool>) -> Result<Resolved, String> {
-    let page = fetch(
-        &format!("https://www.youtube.com/watch?v={id}&hl=en"),
+    const DESKTOP_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
+    let client = crate::request::Client::new()?;
+    let page = client.read(
+        client
+            .get(&format!(
+                "https://www.youtube.com/watch?v={id}&hl=en&bpctr=9999999999&has_verified=1"
+            ))
+            .header("User-Agent", DESKTOP_AGENT)
+            .header("Cookie", "SOCS=CAI; PREF=hl=en&tz=UTC"),
+        4 * 1024 * 1024,
         &cancel,
+        Instant::now() + Duration::from_secs(20),
     )?;
     let text = std::str::from_utf8(&page).map_err(|_| "Invalid YouTube response")?;
     let player = [
@@ -171,6 +181,13 @@ fn youtube(id: &str, cancel: Arc<AtomicBool>) -> Result<Resolved, String> {
             .ok()
     })
     .ok_or("YouTube did not expose playable stream data")?;
+    match youtube_visionos(&client, text, id, &cancel) {
+        Ok(resolved) => return Ok(resolved),
+        Err(_) if cancel.load(std::sync::atomic::Ordering::Relaxed) => {
+            return Err("Video loading cancelled".into());
+        }
+        Err(_) => {}
+    }
     if player["playabilityStatus"]["status"] == "OK"
         && player["streamingData"]["serverAbrStreamingUrl"].is_string()
     {
@@ -187,6 +204,143 @@ fn youtube(id: &str, cancel: Arc<AtomicBool>) -> Result<Resolved, String> {
         });
     }
     parse_youtube(&player)
+}
+
+fn youtube_visionos(
+    client: &crate::request::Client,
+    page: &str,
+    id: &str,
+    cancel: &Arc<AtomicBool>,
+) -> Result<Resolved, String> {
+    const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
+    let visitor = json_after(page, "\"INNERTUBE_CONTEXT\":")
+        .and_then(|context| context["client"]["visitorData"].as_str().map(str::to_owned))
+        .ok_or("YouTube did not provide visitor data")?;
+    if visitor.len() > 4096 {
+        return Err("YouTube visitor data exceeds the limit".into());
+    }
+    let asset = json_after(page, "\"jsUrl\":")
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .ok_or("Missing YouTube player script")?;
+    if !valid_player_asset(&asset) {
+        return Err("Invalid YouTube player script path".into());
+    }
+    let script = client.read(
+        client.get(&format!("https://www.youtube.com{asset}")),
+        8 * 1024 * 1024,
+        cancel,
+        Instant::now() + Duration::from_secs(20),
+    )?;
+    let script = std::str::from_utf8(&script).map_err(|_| "Invalid YouTube player script")?;
+    let timestamp = signature_timestamp(script).ok_or("Missing YouTube signature timestamp")?;
+    let body = serde_json::json!({
+        "context": {"client": {
+            "clientName": "VISIONOS",
+            "clientVersion": "1.02",
+            "deviceMake": "Apple",
+            "deviceModel": "RealityDevice17,1",
+            "userAgent": USER_AGENT,
+            "osName": "visionOS",
+            "osVersion": "26.5.23O471",
+            "hl": "en",
+            "timeZone": "UTC",
+            "utcOffsetMinutes": 0,
+            "visitorData": visitor,
+        }},
+        "videoId": id,
+        "playbackContext": {"contentPlaybackContext": {
+            "html5Preference": "HTML5_PREF_WANTS",
+            "signatureTimestamp": timestamp,
+        }},
+        "contentCheckOk": true,
+        "racyCheckOk": true,
+    });
+    let endpoint =
+        reqwest::Url::parse("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
+            .map_err(|_| "Invalid YouTube player endpoint")?;
+    let response = client.read(
+        client
+            .post(endpoint)
+            .header("Content-Type", "application/json")
+            .header("X-YouTube-Client-Name", "101")
+            .header("X-YouTube-Client-Version", "1.02")
+            .header("X-Goog-Visitor-Id", &visitor)
+            .header("Origin", "https://www.youtube.com")
+            .header("User-Agent", USER_AGENT)
+            .json(&body),
+        4 * 1024 * 1024,
+        cancel,
+        Instant::now() + Duration::from_secs(20),
+    )?;
+    let player: Value =
+        serde_json::from_slice(&response).map_err(|_| "Invalid YouTube player response")?;
+    let duration = player["videoDetails"]["lengthSeconds"]
+        .as_str()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or("YouTube did not provide a duration")?;
+    if duration == 0 || duration > 1200 || player["videoDetails"]["isLiveContent"] == true {
+        return Err("YouTube clips must be recorded videos under 20 minutes".into());
+    }
+    let mut resolved = parse_youtube(&player)?;
+    let audio_url = resolved
+        .audio
+        .take()
+        .ok_or("YouTube did not provide separate AAC audio")?;
+    let mut video_source = crate::http::RemoteFile::open(&resolved.video, cancel.clone())?;
+    if video_source.size > 128 * 1024 * 1024 {
+        return Err("YouTube clip exceeds the 128 MB loading limit".into());
+    }
+    let mut video = Vec::with_capacity(video_source.size as usize);
+    video_source
+        .read_to_end(&mut video)
+        .map_err(|_| "YouTube video download was interrupted")?;
+    let remaining = (128 * 1024 * 1024usize)
+        .checked_sub(video.len())
+        .ok_or("YouTube clip exceeds the 128 MB loading limit")?;
+    let mut audio_source = crate::http::RemoteFile::open(&audio_url, cancel.clone())?;
+    if audio_source.size > remaining as u64 {
+        return Err("YouTube clip exceeds the 128 MB loading limit".into());
+    }
+    let mut audio = Vec::with_capacity(audio_source.size as usize);
+    audio_source
+        .read_to_end(&mut audio)
+        .map_err(|_| "YouTube audio download was interrupted")?;
+    resolved.video.clear();
+    resolved.prepared = Some(Prepared {
+        video: crate::fragment::remux(&video, cancel)?.into(),
+        audio: audio.into(),
+    });
+    Ok(resolved)
+}
+
+fn json_after(text: &str, marker: &str) -> Option<Value> {
+    let start = text.find(marker)? + marker.len();
+    serde_json::Deserializer::from_str(&text[start..])
+        .into_iter::<Value>()
+        .next()?
+        .ok()
+}
+
+fn valid_player_asset(asset: &str) -> bool {
+    asset.starts_with("/s/player/")
+        && asset.len() <= 256
+        && asset
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"/_.-".contains(&byte))
+        && !asset.contains("..")
+        && !asset.contains('?')
+        && !asset.contains('#')
+}
+
+fn signature_timestamp(script: &str) -> Option<u64> {
+    ["signatureTimestamp", "\"sts\""]
+        .iter()
+        .flat_map(|marker| script.split(marker).skip(1))
+        .find_map(|rest| {
+            let rest = rest.trim_start().strip_prefix(':')?.trim_start();
+            let length = rest.bytes().take_while(u8::is_ascii_digit).take(10).count();
+            (length >= 5).then(|| rest[..length].parse().ok()).flatten()
+        })
 }
 
 fn parse_youtube(player: &Value) -> Result<Resolved, String> {
@@ -372,5 +526,14 @@ mod tests {
     fn youtube_selects_muxed_h264_or_separate_aac() {
         let player = serde_json::json!({"playabilityStatus":{"status":"OK"},"streamingData":{"formats":[{"url":"https://rr1.googlevideo.com/video","mimeType":"video/mp4; codecs=avc1,mp4a","height":360}]}});
         assert!(parse_youtube(&player).unwrap().audio.is_none());
+    }
+    #[test]
+    fn youtube_signature_timestamp_is_bounded() {
+        assert_eq!(
+            signature_timestamp("x signatureTimestamp:20702,y"),
+            Some(20702)
+        );
+        assert_eq!(signature_timestamp("x \"sts\" : 20703,y"), Some(20703));
+        assert_eq!(signature_timestamp("signatureTimestamp:12"), None);
     }
 }

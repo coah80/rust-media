@@ -224,7 +224,7 @@ impl MediaReader {
             Self::Local { size, .. } => *size,
         }
     }
-    fn duplicate(&self) -> Result<Self, String> {
+    pub fn duplicate(&self) -> Result<Self, String> {
         match self {
             Self::Memory(file) => Ok(Self::Memory(file.clone())),
             Self::Remote(file) => Ok(Self::Remote(file.clone())),
