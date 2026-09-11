@@ -879,14 +879,14 @@ fn segment_boxes<R: Read + Seek>(
             .seek(SeekFrom::Start(offset))
             .map_err(|_| "Could not seek video segment")?;
         let (kind, payload, end) = box_header(reader, offset, range.end)?;
+        let payload_start = reader
+            .stream_position()
+            .map_err(|_| "Could not read video segment")?;
         match &kind {
             b"moof" => {
-                if reader.stream_position().ok() != Some(offset + 8) {
-                    return Err("Unsupported extended video fragment".into());
-                }
-                validate_fragment_runs(reader, offset + 8, end, None)?;
+                validate_fragment_runs(reader, payload_start, end, None)?;
                 reader
-                    .seek(SeekFrom::Start(offset + 8))
+                    .seek(SeekFrom::Start(payload_start))
                     .map_err(|_| "Could not seek video fragment")?;
                 let moof = mp4::MoofBox::read_box(reader, payload + 8)
                     .map_err(|_| "Could not parse video fragment")?;
@@ -1161,5 +1161,34 @@ mod tests {
         let parsed =
             mp4::Mp4Reader::read_header(std::io::Cursor::new(bytes), bytes.len() as u64).unwrap();
         assert!(fragment_config(&parsed).unwrap().audio);
+    }
+
+    #[test]
+    fn macroscope_segment_boxes_accept_extended_moof() {
+        let source = include_bytes!("../tests/fixtures/fragmented.mp4");
+        let moof_kind = source
+            .windows(4)
+            .position(|value| value == b"moof")
+            .unwrap();
+        let moof_start = moof_kind - 4;
+        let moof_size =
+            u32::from_be_bytes(source[moof_start..moof_start + 4].try_into().unwrap()) as usize;
+        let mdat_start = moof_start + moof_size;
+        let mdat_size =
+            u32::from_be_bytes(source[mdat_start..mdat_start + 4].try_into().unwrap()) as usize;
+        let mut pair = source[moof_start..mdat_start + mdat_size].to_vec();
+        let trun = pair.windows(4).position(|value| value == b"trun").unwrap();
+        let data_offset = trun + 12;
+        let value = i32::from_be_bytes(pair[data_offset..data_offset + 4].try_into().unwrap());
+        pair[data_offset..data_offset + 4].copy_from_slice(&(value + 8).to_be_bytes());
+        let mut extended = Vec::with_capacity(pair.len() + 8);
+        extended.extend_from_slice(&1u32.to_be_bytes());
+        extended.extend_from_slice(b"moof");
+        extended.extend_from_slice(&((moof_size + 8) as u64).to_be_bytes());
+        extended.extend_from_slice(&pair[8..]);
+        let range = 0..extended.len() as u64;
+        let (moofs, mdats) = segment_boxes(&mut std::io::Cursor::new(extended), range).unwrap();
+        assert_eq!(moofs.len(), 1);
+        assert_eq!(mdats.len(), 1);
     }
 }
