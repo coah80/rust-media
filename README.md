@@ -13,7 +13,7 @@ There is no WebView, browser engine, JavaScript interpreter, mpv, FFmpeg runtime
 | Local H.264 MP4 with optional AAC | Video, audio, pause, seek and replay verified on Windows |
 | Direct MP4 from supported media hosts | Bounded HTTP range reads and native decoding |
 | FixupX / FxTwitter public video posts | Public metadata adapter and native playback verified |
-| YouTube | Adapter parses public player data and accepts direct H.264/AAC URLs. The tested video required JavaScript URL resolution and **did not play** |
+| YouTube | Adapter parses public player data and accepts direct H.264/AAC URLs. The two tested public videos returned SABR metadata without usable media URLs and **did not play** |
 | HTML, JavaScript widgets, arbitrary iframes | Not implemented |
 
 The demo has volume, mute, fullscreen, keyboard controls, a seek bar, and controls that hide during playback. It is a standalone experiment, not a Discord player parity claim or a completed Fastcord integration.
@@ -64,7 +64,7 @@ Keep the player alive and poll `snapshot()` from the application's event loop. E
 - Simple single-segment MP4 edits are supported. Multiple edit segments are rejected. There is no adaptive bitrate selection or automatic network retry/backoff.
 - HTTPS media hosts are explicitly allowed in `http::allowed`; every redirect is checked again. Arbitrary website and local-network URLs are rejected. No account cookies or credentials are used. Local file paths must be supplied explicitly.
 - FixupX chooses the first video in a post. Other videos in the same post are not exposed in the demo.
-- YouTube does not work for the tested modern signature-protected stream. A Rust provider resolver is the next research task; this project does not silently launch a browser or another downloader.
+- YouTube playback remains unverified. The tested responses require SABR transport, not merely signature resolution. See [the YouTube experiment](docs/youtube.md) for observations and next steps; this project does not silently launch a browser or another downloader.
 
 ## Validation
 
@@ -76,7 +76,7 @@ cargo check --locked --no-default-features --lib
 
 Windows checks exercised native video and AAC playback, pause across frames, seeking while paused, resume, mute, fullscreen, Escape, resizing, end-of-file and replay with both Slint renderers. A live FixupX clip passed the same interaction sequence with femtovg. The temporary UI driver was removed after verification. Audio progress was checked through the active output pipeline; listening quality was not assessed.
 
-On the development machine, the decoder probe processed 60 generated 1280×720 H.264 frames in 0.786 seconds, including opening the file and lookahead. This is a single local probe, not a general performance benchmark. FixupX returned 60 decodable 482×360 frames with a 19.034-second duration. The live YouTube probe returned the explicit unsupported-resolver error above.
+On the development machine, the decoder probe processed 60 generated 1280×720 H.264 frames in 0.786 seconds, including opening the file and lookahead. This is a single local probe, not a general performance benchmark. FixupX returned 60 decodable 482×360 frames with a 19.034-second duration. The follow-up live YouTube probes returned the explicit unsupported-SABR error.
 
 The small committed test pattern checks frame ordering, MP4 time offsets, pixel stability after seek and malformed input handling. Provider and player tests cover destination restrictions, stale playback cancellation and invalid control values. The fixture was generated locally, contains no account data and needs no FFmpeg installation to run tests.
 

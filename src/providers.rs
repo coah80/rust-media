@@ -201,7 +201,7 @@ fn parse_youtube(player: &Value) -> Result<Resolved, String> {
             audio = Some(format);
         }
     }
-    let video = video.ok_or("YouTube requires its JavaScript stream resolver. This Rust-only adapter cannot play it yet")?;
+    let video = video.ok_or_else(|| youtube_stream_error(data))?;
     let muxed = video["mimeType"]
         .as_str()
         .unwrap_or_default()
@@ -224,6 +224,27 @@ fn parse_youtube(player: &Value) -> Result<Resolved, String> {
             .into(),
         provider: "YouTube".into(),
     })
+}
+
+fn youtube_stream_error(data: &Value) -> &'static str {
+    let formats = ["formats", "adaptiveFormats"]
+        .iter()
+        .flat_map(|key| data[key].as_array().into_iter().flatten());
+    let mut direct = false;
+    let mut cipher = false;
+    for format in formats {
+        direct |= format["url"].is_string();
+        cipher |= format["signatureCipher"].is_string() || format["cipher"].is_string();
+    }
+    if direct {
+        "YouTube did not provide a supported H.264 stream"
+    } else if cipher {
+        "This YouTube stream needs URL signature resolution, which is not supported yet"
+    } else if data["serverAbrStreamingUrl"].is_string() {
+        "This YouTube video uses SABR streaming, which is not supported yet"
+    } else {
+        "YouTube did not provide a supported media stream"
+    }
 }
 
 #[cfg(test)]
