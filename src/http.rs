@@ -69,6 +69,14 @@ pub fn allowed(value: &str) -> bool {
                 matches!(
                     host,
                     "video.twimg.com"
+                        | "i.imgur.com"
+                        | "media.giphy.com"
+                        | "i.giphy.com"
+                        | "media0.giphy.com"
+                        | "media1.giphy.com"
+                        | "media2.giphy.com"
+                        | "media3.giphy.com"
+                        | "media4.giphy.com"
                         | "cdn.discordapp.com"
                         | "media.discordapp.net"
                         | "images-ext-1.discordapp.net"
