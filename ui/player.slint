@@ -25,6 +25,7 @@ export component PlayerWindow inherits Window {
     in property <string> error;
     in property <float> position;
     in property <float> duration;
+    in property <float> buffered;
     in-out property <float> volume: 1;
     in-out property <bool> muted;
     in-out property <bool> expanded;
@@ -83,7 +84,8 @@ export component PlayerWindow inherits Window {
             visible: root.controls-visible && root.status != 0;
             y: parent.height - 64px; width: parent.width; height: 64px; background: #141518e8;
             TouchArea { moved => { root.idle = 0; } }
-            progress := Rectangle { x: 16px; y: 10px; width: parent.width - 32px; height: 4px; border-radius: 2px; background: #646974;
+            progress := Rectangle { x: 16px; y: 10px; width: parent.width - 32px; height: 4px; border-radius: 2px; background: #3f424a;
+                Rectangle { x: 0px; y: 0px; width: parent.width * clamp(root.buffered, 0, 1); height: parent.height; border-radius: 2px; background: #8f949e; }
                 Rectangle { x: 0px; y: 0px; width: parent.width * (root.duration > 0 ? clamp(root.position / root.duration, 0, 1) : 0); height: parent.height; border-radius: 2px; background: #f2f3f5; }
             }
             TouchArea { x: 16px; y: 0px; width: parent.width - 32px; height: 22px; enabled: root.duration > 0; mouse-cursor: pointer;

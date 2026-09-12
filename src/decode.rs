@@ -1,6 +1,11 @@
 use crate::Pixels;
+use mp4::ReadBox;
 use rusty_h264_decoder::Decoder;
-use std::io::{Read, Seek};
+use std::{
+    io::{Read, Seek, SeekFrom},
+    ops::Range,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 pub struct Video<R> {
     reader: mp4::Mp4Reader<R>,
@@ -18,7 +23,11 @@ pub struct Video<R> {
 }
 
 impl<R: Read + Seek> Video<R> {
-    pub fn new(reader: R, size: u64) -> Result<Self, String> {
+    pub fn new(mut reader: R, size: u64) -> Result<Self, String> {
+        validate_mp4_initialization(&mut reader, size)?;
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| "Could not seek video initialization")?;
         let reader = mp4::Mp4Reader::read_header(reader, size)
             .map_err(|_| "This video is not a supported MP4")?;
         let track = reader
@@ -131,13 +140,18 @@ impl<R: Read + Seek> Video<R> {
                 high = mid - 1;
             }
         }
-        while low > 1 {
+        loop {
             let sample = self
                 .reader
                 .read_sample(self.track, low)
                 .map_err(|_| "Could not seek video")?
                 .ok_or("Missing video sample")?;
-            if sample.is_sync {
+            let presentation =
+                (sample.start_time as f64 + f64::from(sample.rendering_offset)) / self.scale;
+            if sample.is_sync && (presentation <= seconds || low == 1) {
+                break;
+            }
+            if low == 1 {
                 break;
             }
             low -= 1;
@@ -159,15 +173,20 @@ impl<R: Read + Seek> Video<R> {
                 .map_err(|_| "Could not read video")?
                 .ok_or("Missing video sample")?;
             self.next += 1;
-            let packet = annex_b(&sample.bytes, self.length)?;
+            let time = (sample.start_time as f64 + f64::from(sample.rendering_offset)) / self.scale
+                - self.offset;
+            let (packet, idr) = annex_b(&sample.bytes, self.length)?;
+            if idr {
+                self.decoder = Decoder::new();
+                self.decoder
+                    .decode(&self.header)
+                    .map_err(|_| "Invalid video configuration")?;
+            }
             if let Some(frame) = self
                 .decoder
                 .decode(&packet)
                 .map_err(|_| "Could not decode this video")?
             {
-                let time = (sample.start_time as f64 + f64::from(sample.rendering_offset))
-                    / self.scale
-                    - self.offset;
                 self.pending.push((time.max(0.), pixels(frame)?));
             }
         }
@@ -181,9 +200,1201 @@ impl<R: Read + Seek> Video<R> {
     }
 }
 
-fn annex_b(bytes: &[u8], length: usize) -> Result<Vec<u8>, String> {
+struct FragmentSample {
+    offset: u64,
+    size: usize,
+    start: u64,
+    rendering_offset: i32,
+    sync: bool,
+}
+
+struct FragmentSegment {
+    range: Range<u64>,
+    start: u64,
+    duration: u64,
+    starts_with_sap: bool,
+}
+
+struct FragmentPlan {
+    segments: Vec<FragmentSegment>,
+    track: u32,
+    timescale: u32,
+    origin: u64,
+}
+
+#[derive(Clone, Copy)]
+struct TrackDefaults {
+    track: u32,
+    duration: u32,
+    size: u32,
+    flags: u32,
+}
+
+struct FragmentConfig {
+    decoder: Decoder,
+    header: Vec<u8>,
+    track: u32,
+    length: usize,
+    scale: f64,
+    default_duration: Option<u32>,
+    default_size: Option<u32>,
+    default_flags: Option<u32>,
+    defaults: Vec<TrackDefaults>,
+    offset: Option<u64>,
+    audio: bool,
+}
+
+type SegmentBoxes = (Vec<(mp4::MoofBox, u64)>, Vec<Range<u64>>);
+
+pub struct FragmentVideo<R> {
+    reader: R,
+    decoder: Decoder,
+    header: Vec<u8>,
+    samples: Vec<FragmentSample>,
+    length: usize,
+    scale: f64,
+    next: usize,
+    pending: Vec<(f64, Pixels)>,
+    duration: f64,
+    track: u32,
+    default_duration: Option<u32>,
+    default_size: Option<u32>,
+    default_flags: Option<u32>,
+    defaults: Vec<TrackDefaults>,
+    segments: Vec<FragmentSegment>,
+    segment: usize,
+    segment_scale: f64,
+    segment_origin: f64,
+    offset: f64,
+    audio: bool,
+}
+
+impl<R: Read + Seek> FragmentVideo<R> {
+    fn new(mut reader: R, header_reader: R, size: u64) -> Result<Self, String> {
+        let plans = fragment_plans(&mut reader, size)?;
+        if !plans.is_empty() {
+            return Self::new_indexed(reader, header_reader, size, plans);
+        }
+        Self::new_eager(reader, header_reader, size)
+    }
+
+    fn new_indexed(
+        reader: R,
+        mut header_reader: R,
+        size: u64,
+        plans: Vec<FragmentPlan>,
+    ) -> Result<Self, String> {
+        let header_end = plans
+            .iter()
+            .filter_map(|plan| plan.segments.first())
+            .map(|segment| segment.range.start)
+            .min()
+            .ok_or("The video contains no media segments")?;
+        header_reader
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| "Could not seek video initialization")?;
+        validate_mp4_initialization(&mut header_reader, header_end)?;
+        header_reader
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| "Could not seek video initialization")?;
+        let defaults = fragment_defaults(&mut header_reader, header_end)?;
+        header_reader
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| "Could not seek video initialization")?;
+        let parsed = mp4::Mp4Reader::read_header(&mut header_reader, header_end)
+            .map_err(|_| "This video is not a supported fragmented MP4")?;
+        let config = fragment_config(&parsed, defaults)?;
+        let mut matching: Vec<_> = plans
+            .into_iter()
+            .filter(|plan| plan.track == config.track)
+            .collect();
+        if matching.is_empty() {
+            drop(parsed);
+            header_reader
+                .seek(SeekFrom::Start(0))
+                .map_err(|_| "Could not seek video initialization")?;
+            return Self::new_eager(reader, header_reader, size);
+        }
+        matching.sort_by_key(|plan| {
+            plan.segments
+                .first()
+                .map_or(u64::MAX, |segment| segment.range.start)
+        });
+        let mut plan = matching.remove(0);
+        for next in matching {
+            let previous = plan
+                .segments
+                .last()
+                .ok_or("The video contains no media segments")?;
+            let following = next
+                .segments
+                .first()
+                .ok_or("The video contains no media segments")?;
+            if next.timescale != plan.timescale
+                || previous.range.end > following.range.start
+                || previous
+                    .start
+                    .checked_add(previous.duration)
+                    .is_none_or(|end| end != following.start)
+            {
+                return Err("Video segment indexes are not contiguous".into());
+            }
+            plan.segments.extend(next.segments);
+        }
+        let offset = config
+            .offset
+            .map_or(plan.origin as f64 / f64::from(plan.timescale), |value| {
+                value as f64 / config.scale
+            });
+        let end = plan
+            .segments
+            .last()
+            .and_then(|segment| segment.start.checked_add(segment.duration))
+            .ok_or("Invalid video segment duration")? as f64
+            / f64::from(plan.timescale);
+        if end < offset {
+            return Err("Invalid video segment duration".into());
+        }
+        let duration = end - offset;
+        let mut video = Self {
+            reader,
+            decoder: config.decoder,
+            header: config.header,
+            samples: Vec::new(),
+            length: config.length,
+            scale: config.scale,
+            next: 0,
+            pending: Vec::new(),
+            duration,
+            track: config.track,
+            default_duration: config.default_duration,
+            default_size: config.default_size,
+            default_flags: config.default_flags,
+            defaults: config.defaults,
+            segments: plan.segments,
+            segment: 0,
+            segment_scale: f64::from(plan.timescale),
+            segment_origin: offset * f64::from(plan.timescale),
+            offset,
+            audio: config.audio,
+        };
+        video.load_segment(0)?;
+        Ok(video)
+    }
+
+    fn new_eager(mut reader: R, mut header_reader: R, size: u64) -> Result<Self, String> {
+        let (moof_offsets, mdats) = top_level_boxes(&mut reader, size)?;
+        validate_mp4_initialization(&mut header_reader, size)?;
+        header_reader
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| "Could not seek video initialization")?;
+        let defaults = fragment_defaults(&mut header_reader, size)?;
+        header_reader
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| "Could not seek video initialization")?;
+        let parsed = mp4::Mp4Reader::read_header(header_reader, size)
+            .map_err(|_| "This video is not a supported fragmented MP4")?;
+        if parsed.moofs.len() != moof_offsets.len() {
+            return Err("The video fragment table is inconsistent".into());
+        }
+        let config = fragment_config(&parsed, defaults)?;
+        let mut samples = Vec::new();
+        let mut expected_time = None;
+        let mut first_time = None;
+        for (moof, moof_offset) in parsed.moofs.iter().zip(moof_offsets) {
+            let Some((traf_index, traf)) = moof
+                .trafs
+                .iter()
+                .enumerate()
+                .find(|(_, traf)| traf.tfhd.track_id == config.track)
+            else {
+                continue;
+            };
+            let run = traf.trun.as_ref().ok_or("Missing video fragment run")?;
+            if run.sample_count > 100_000 {
+                return Err("Video fragment exceeds the sample limit".into());
+            }
+            let mut time = traf
+                .tfdt
+                .as_ref()
+                .map(|value| value.base_media_decode_time)
+                .or(expected_time)
+                .unwrap_or(0);
+            if expected_time.is_some_and(|expected| time != expected) {
+                return Err("Video fragments are not contiguous".into());
+            }
+            first_time.get_or_insert(time);
+            let mut position =
+                fragment_data_start(moof, traf_index, moof_offset, &config.defaults)?;
+            for index in 0..run.sample_count as usize {
+                if samples.len() >= 1_000_000 {
+                    return Err("Video exceeds the sample limit".into());
+                }
+                let duration = run
+                    .sample_durations
+                    .get(index)
+                    .copied()
+                    .or(traf.tfhd.default_sample_duration)
+                    .or(config.default_duration)
+                    .ok_or("Missing video sample duration")?;
+                let sample_size = run
+                    .sample_sizes
+                    .get(index)
+                    .copied()
+                    .or(traf.tfhd.default_sample_size)
+                    .or(config.default_size)
+                    .ok_or("Missing video sample size")? as usize;
+                let end = position
+                    .checked_add(sample_size as u64)
+                    .ok_or("Invalid video sample offset")?;
+                if duration == 0
+                    || sample_size == 0
+                    || sample_size > 8 * 1024 * 1024
+                    || !mdats
+                        .iter()
+                        .any(|range| range.start <= position && end <= range.end)
+                {
+                    return Err("Video sample is outside its media fragment".into());
+                }
+                let flags = run
+                    .sample_flags
+                    .get(index)
+                    .copied()
+                    .or(if index == 0 {
+                        run.first_sample_flags
+                    } else {
+                        None
+                    })
+                    .or(traf.tfhd.default_sample_flags)
+                    .or(config.default_flags)
+                    .unwrap_or(0);
+                let cts = run.sample_cts.get(index).copied().unwrap_or(0);
+                let rendering_offset = if run.version == 0 {
+                    i32::try_from(cts).map_err(|_| "Invalid video composition time")?
+                } else {
+                    cts as i32
+                };
+                samples.push(FragmentSample {
+                    offset: position,
+                    size: sample_size,
+                    start: time,
+                    rendering_offset,
+                    sync: flags & 0x10000 == 0,
+                });
+                position = end;
+                time = time
+                    .checked_add(u64::from(duration))
+                    .ok_or("Video timestamp overflow")?;
+            }
+            expected_time = Some(time);
+        }
+        if samples.is_empty() {
+            return Err("The video contains no samples".into());
+        }
+        let end = expected_time.ok_or("The video contains no samples")?;
+        let offset_ticks = config.offset.unwrap_or(first_time.unwrap_or(0));
+        if end < offset_ticks {
+            return Err("Invalid video duration".into());
+        }
+        Ok(Self {
+            reader,
+            decoder: config.decoder,
+            header: config.header,
+            samples,
+            length: config.length,
+            scale: config.scale,
+            next: 0,
+            pending: Vec::new(),
+            duration: (end - offset_ticks) as f64 / config.scale,
+            track: config.track,
+            default_duration: config.default_duration,
+            default_size: config.default_size,
+            default_flags: config.default_flags,
+            defaults: config.defaults,
+            segments: Vec::new(),
+            segment: 0,
+            segment_scale: config.scale,
+            segment_origin: 0.,
+            offset: offset_ticks as f64 / config.scale,
+            audio: config.audio,
+        })
+    }
+
+    fn load_segment(&mut self, index: usize) -> Result<(), String> {
+        let segment = self.segments.get(index).ok_or("Missing video segment")?;
+        let (moofs, mdats) = segment_boxes(&mut self.reader, segment.range.clone())?;
+        let mut samples = Vec::new();
+        let mut expected_time = None;
+        for (moof, moof_offset) in moofs {
+            let Some((traf_index, traf)) = moof
+                .trafs
+                .iter()
+                .enumerate()
+                .find(|(_, traf)| traf.tfhd.track_id == self.track)
+            else {
+                continue;
+            };
+            let run = traf.trun.as_ref().ok_or("Missing video fragment run")?;
+            if run.sample_count > 100_000 {
+                return Err("Video fragment exceeds the sample limit".into());
+            }
+            ensure_fragment_sample_limit(samples.len(), run.sample_count as usize)?;
+            let mut time = traf
+                .tfdt
+                .as_ref()
+                .map(|value| value.base_media_decode_time)
+                .or(expected_time)
+                .ok_or("Missing video fragment timestamp")?;
+            if expected_time.is_some_and(|expected| expected != time) {
+                return Err("Video fragments are not contiguous".into());
+            }
+            let mut position = fragment_data_start(&moof, traf_index, moof_offset, &self.defaults)?;
+            for sample_index in 0..run.sample_count as usize {
+                let duration = run
+                    .sample_durations
+                    .get(sample_index)
+                    .copied()
+                    .or(traf.tfhd.default_sample_duration)
+                    .or(self.default_duration)
+                    .ok_or("Missing video sample duration")?;
+                let sample_size = run
+                    .sample_sizes
+                    .get(sample_index)
+                    .copied()
+                    .or(traf.tfhd.default_sample_size)
+                    .or(self.default_size)
+                    .ok_or("Missing video sample size")? as usize;
+                let end = position
+                    .checked_add(sample_size as u64)
+                    .ok_or("Invalid video sample offset")?;
+                if duration == 0
+                    || sample_size == 0
+                    || sample_size > 8 * 1024 * 1024
+                    || !mdats
+                        .iter()
+                        .any(|range| range.start <= position && end <= range.end)
+                {
+                    return Err("Video sample is outside its media fragment".into());
+                }
+                let flags = run
+                    .sample_flags
+                    .get(sample_index)
+                    .copied()
+                    .or(if sample_index == 0 {
+                        run.first_sample_flags
+                    } else {
+                        None
+                    })
+                    .or(traf.tfhd.default_sample_flags)
+                    .or(self.default_flags)
+                    .unwrap_or(0);
+                let cts = run.sample_cts.get(sample_index).copied().unwrap_or(0);
+                let rendering_offset = if run.version == 0 {
+                    i32::try_from(cts).map_err(|_| "Invalid video composition time")?
+                } else {
+                    cts as i32
+                };
+                samples.push(FragmentSample {
+                    offset: position,
+                    size: sample_size,
+                    start: time,
+                    rendering_offset,
+                    sync: flags & 0x10000 == 0,
+                });
+                position = end;
+                time = time
+                    .checked_add(u64::from(duration))
+                    .ok_or("Video timestamp overflow")?;
+            }
+            expected_time = Some(time);
+        }
+        if samples.is_empty() {
+            return Err("The video segment contains no samples".into());
+        }
+        self.samples = samples;
+        self.next = 0;
+        self.segment = index;
+        Ok(())
+    }
+
+    fn seek(&mut self, seconds: f64) -> Result<(), String> {
+        if !self.segments.is_empty() {
+            let target = seconds.max(0.) * self.segment_scale + self.segment_origin;
+            let segment = indexed_seek_segment(&self.segments, target);
+            self.load_segment(segment)?;
+        }
+        let target = (seconds.max(0.) + self.offset) * self.scale;
+        let next = self
+            .samples
+            .iter()
+            .enumerate()
+            .filter(|(_, sample)| {
+                sample.sync && sample.start as f64 + f64::from(sample.rendering_offset) <= target
+            })
+            .map(|(index, _)| index)
+            .next_back()
+            .unwrap_or(0);
+        self.decoder = Decoder::new();
+        self.decoder
+            .decode(&self.header)
+            .map_err(|_| "Invalid video configuration")?;
+        self.next = next;
+        self.pending.clear();
+        Ok(())
+    }
+
+    fn frame(&mut self) -> Result<Option<(f64, Pixels)>, String> {
+        while self.pending.len() < 16 {
+            if self.next >= self.samples.len() {
+                if self.segments.is_empty() || self.segment + 1 >= self.segments.len() {
+                    break;
+                }
+                self.load_segment(self.segment + 1)?;
+            }
+            let sample = &self.samples[self.next];
+            let mut bytes = vec![0; sample.size];
+            self.reader
+                .seek(SeekFrom::Start(sample.offset))
+                .and_then(|_| self.reader.read_exact(&mut bytes))
+                .map_err(|_| "Could not read video")?;
+            self.next += 1;
+            let time = (sample.start as f64 + f64::from(sample.rendering_offset)) / self.scale
+                - self.offset;
+            let (packet, idr) = annex_b(&bytes, self.length)?;
+            if idr {
+                self.decoder = Decoder::new();
+                self.decoder
+                    .decode(&self.header)
+                    .map_err(|_| "Invalid video configuration")?;
+            }
+            if let Some(frame) = self
+                .decoder
+                .decode(&packet)
+                .map_err(|_| "Could not decode this video")?
+            {
+                self.pending.push((time.max(0.), pixels(frame)?));
+            }
+        }
+        self.pending
+            .sort_by(|left, right| left.0.total_cmp(&right.0));
+        Ok(if self.pending.is_empty() {
+            None
+        } else {
+            Some(self.pending.remove(0))
+        })
+    }
+}
+
+fn fragment_data_start(
+    moof: &mp4::MoofBox,
+    target: usize,
+    moof_offset: u64,
+    defaults: &[TrackDefaults],
+) -> Result<u64, String> {
+    let mut preceding_end = moof_offset;
+    for (index, traf) in moof.trafs.iter().enumerate() {
+        let base = traf.tfhd.base_data_offset.unwrap_or({
+            if index == 0 || traf.tfhd.flags & 0x020000 != 0 {
+                moof_offset
+            } else {
+                preceding_end
+            }
+        });
+        let run = traf.trun.as_ref().ok_or("Missing video fragment run")?;
+        let start = base
+            .checked_add_signed(i64::from(run.data_offset.unwrap_or(0)))
+            .ok_or("Invalid video fragment offset")?;
+        if index == target {
+            return Ok(start);
+        }
+        let size = if run.sample_sizes.len() == run.sample_count as usize {
+            run.sample_sizes
+                .iter()
+                .try_fold(0u64, |total, size| total.checked_add(u64::from(*size)))
+        } else if run.sample_sizes.is_empty() {
+            traf.tfhd
+                .default_sample_size
+                .or_else(|| {
+                    defaults
+                        .iter()
+                        .find(|defaults| defaults.track == traf.tfhd.track_id)
+                        .map(|defaults| defaults.size)
+                })
+                .and_then(|size| u64::from(size).checked_mul(u64::from(run.sample_count)))
+        } else {
+            None
+        }
+        .ok_or("Missing preceding fragment sample size")?;
+        preceding_end = start
+            .checked_add(size)
+            .ok_or("Invalid video fragment offset")?;
+    }
+    Err("Missing video fragment track".into())
+}
+
+fn indexed_seek_segment(segments: &[FragmentSegment], target: f64) -> usize {
+    let target = segments
+        .iter()
+        .enumerate()
+        .filter(|(_, segment)| segment.start as f64 <= target)
+        .map(|(index, _)| index)
+        .next_back()
+        .unwrap_or(0);
+    (0..=target.saturating_sub(1))
+        .rev()
+        .find(|index| segments[*index].starts_with_sap)
+        .unwrap_or(0)
+}
+
+pub enum MediaVideo<R> {
+    Standard(Box<Video<R>>),
+    Fragmented(Box<FragmentVideo<R>>),
+}
+
+impl<R: Read + Seek> MediaVideo<R> {
+    pub fn open(mut reader: R, header_reader: R, size: u64) -> Result<Self, String> {
+        let fragmented = is_fragmented(&mut reader, size)?;
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| "Could not seek video")?;
+        if fragmented {
+            Self::fragmented(reader, header_reader, size)
+        } else {
+            Self::standard(reader, size)
+        }
+    }
+
+    pub fn standard(reader: R, size: u64) -> Result<Self, String> {
+        Video::new(reader, size).map(Box::new).map(Self::Standard)
+    }
+
+    pub fn fragmented(reader: R, header_reader: R, size: u64) -> Result<Self, String> {
+        FragmentVideo::new(reader, header_reader, size)
+            .map(Box::new)
+            .map(Self::Fragmented)
+    }
+
+    pub fn duration(&self) -> f64 {
+        match self {
+            Self::Standard(video) => video.duration,
+            Self::Fragmented(video) => video.duration,
+        }
+    }
+
+    pub fn has_audio(&self) -> bool {
+        match self {
+            Self::Standard(video) => video.audio,
+            Self::Fragmented(video) => video.audio,
+        }
+    }
+
+    pub fn seek(&mut self, seconds: f64) -> Result<(), String> {
+        match self {
+            Self::Standard(video) => video.seek(seconds),
+            Self::Fragmented(video) => video.seek(seconds),
+        }
+    }
+
+    pub fn frame(&mut self) -> Result<Option<(f64, Pixels)>, String> {
+        match self {
+            Self::Standard(video) => video.frame(),
+            Self::Fragmented(video) => video.frame(),
+        }
+    }
+}
+
+fn is_fragmented<R: Read + Seek>(reader: &mut R, size: u64) -> Result<bool, String> {
+    let mut offset = 0u64;
+    let mut boxes = 0usize;
+    while offset < size {
+        boxes += 1;
+        if boxes > 100_000 {
+            return Err("Video exceeds the box limit".into());
+        }
+        reader
+            .seek(SeekFrom::Start(offset))
+            .map_err(|_| "Could not seek video")?;
+        let (kind, _, end) = box_header(reader, offset, size)?;
+        if &kind == b"moof" {
+            return Ok(true);
+        }
+        offset = end;
+    }
+    Ok(false)
+}
+
+pub(crate) fn validate_mp4_initialization<R: Read + Seek>(
+    reader: &mut R,
+    size: u64,
+) -> Result<(), String> {
+    let mut boxes = 0usize;
+    let mut samples = 0usize;
+    let mut entries = 0usize;
+    validate_mp4_box_range(reader, 0, size, 0, &mut boxes, &mut samples, &mut entries)
+}
+
+fn validate_mp4_box_range<R: Read + Seek>(
+    reader: &mut R,
+    start: u64,
+    end: u64,
+    depth: usize,
+    boxes: &mut usize,
+    samples: &mut usize,
+    entries: &mut usize,
+) -> Result<(), String> {
+    if depth > 8 {
+        return Err("Video initialization is nested too deeply".into());
+    }
+    let mut offset = start;
+    while offset < end {
+        *boxes += 1;
+        if *boxes > 100_000 {
+            return Err("Video exceeds the box limit".into());
+        }
+        reader
+            .seek(SeekFrom::Start(offset))
+            .map_err(|_| "Could not seek video initialization")?;
+        let (kind, _, box_end) = box_header(reader, offset, end)?;
+        let payload = reader
+            .stream_position()
+            .map_err(|_| "Could not read video initialization")?;
+        if matches!(
+            &kind,
+            b"moov" | b"trak" | b"mdia" | b"minf" | b"stbl" | b"edts" | b"mvex"
+        ) {
+            validate_mp4_box_range(reader, payload, box_end, depth + 1, boxes, samples, entries)?;
+        } else if &kind == b"stsz" {
+            if box_end - payload < 12 {
+                return Err("Invalid video sample table".into());
+            }
+            let mut header = [0; 12];
+            reader
+                .read_exact(&mut header)
+                .map_err(|_| "Could not read video initialization")?;
+            let count = u32::from_be_bytes(header[8..12].try_into().unwrap()) as usize;
+            ensure_fragment_sample_limit(*samples, count)?;
+            *samples += count;
+        } else if matches!(
+            &kind,
+            b"stts" | b"ctts" | b"stsc" | b"stss" | b"stco" | b"co64" | b"elst"
+        ) {
+            if box_end - payload < 8 {
+                return Err("Invalid video sample table".into());
+            }
+            let mut header = [0; 8];
+            reader
+                .read_exact(&mut header)
+                .map_err(|_| "Could not read video initialization")?;
+            let count = u32::from_be_bytes(header[4..8].try_into().unwrap()) as usize;
+            if entries
+                .checked_add(count)
+                .is_none_or(|total| total > 1_000_000)
+            {
+                return Err("Video exceeds the initialization entry limit".into());
+            }
+            *entries += count;
+        }
+        offset = box_end;
+    }
+    Ok(())
+}
+
+fn fragment_defaults<R: Read + Seek>(
+    reader: &mut R,
+    size: u64,
+) -> Result<Vec<TrackDefaults>, String> {
+    let mut defaults = Vec::new();
+    let mut offset = 0u64;
+    let mut boxes = 0usize;
+    while offset < size {
+        boxes += 1;
+        if boxes > 100_000 {
+            return Err("Video exceeds the box limit".into());
+        }
+        reader
+            .seek(SeekFrom::Start(offset))
+            .map_err(|_| "Could not seek video initialization")?;
+        let (kind, _, end) = box_header(reader, offset, size)?;
+        let payload = reader
+            .stream_position()
+            .map_err(|_| "Could not read video initialization")?;
+        if &kind != b"moov" {
+            offset = end;
+            continue;
+        }
+        let mut child = payload;
+        while child < end {
+            boxes += 1;
+            if boxes > 100_000 {
+                return Err("Video exceeds the box limit".into());
+            }
+            reader
+                .seek(SeekFrom::Start(child))
+                .map_err(|_| "Could not seek video initialization")?;
+            let (child_kind, _, child_end) = box_header(reader, child, end)?;
+            let child_payload = reader
+                .stream_position()
+                .map_err(|_| "Could not read video initialization")?;
+            if &child_kind == b"mvex" {
+                let mut nested = child_payload;
+                while nested < child_end {
+                    boxes += 1;
+                    if boxes > 100_000 {
+                        return Err("Video exceeds the box limit".into());
+                    }
+                    reader
+                        .seek(SeekFrom::Start(nested))
+                        .map_err(|_| "Could not seek video initialization")?;
+                    let (nested_kind, _, nested_end) = box_header(reader, nested, child_end)?;
+                    let nested_payload = reader
+                        .stream_position()
+                        .map_err(|_| "Could not read video initialization")?;
+                    if &nested_kind == b"trex" {
+                        if nested_end - nested_payload < 24 || defaults.len() >= 256 {
+                            return Err("Invalid video track defaults".into());
+                        }
+                        reader
+                            .seek(SeekFrom::Start(nested_payload))
+                            .map_err(|_| "Could not seek video initialization")?;
+                        let mut bytes = [0; 24];
+                        reader
+                            .read_exact(&mut bytes)
+                            .map_err(|_| "Could not read video initialization")?;
+                        let track = u32::from_be_bytes(bytes[4..8].try_into().unwrap());
+                        if defaults
+                            .iter()
+                            .any(|defaults: &TrackDefaults| defaults.track == track)
+                        {
+                            return Err("Duplicate video track defaults".into());
+                        }
+                        defaults.push(TrackDefaults {
+                            track,
+                            duration: u32::from_be_bytes(bytes[12..16].try_into().unwrap()),
+                            size: u32::from_be_bytes(bytes[16..20].try_into().unwrap()),
+                            flags: u32::from_be_bytes(bytes[20..24].try_into().unwrap()),
+                        });
+                    }
+                    nested = nested_end;
+                }
+            }
+            child = child_end;
+        }
+        break;
+    }
+    Ok(defaults)
+}
+
+fn fragment_config<R: Read + Seek>(
+    parsed: &mp4::Mp4Reader<R>,
+    defaults: Vec<TrackDefaults>,
+) -> Result<FragmentConfig, String> {
+    let track = parsed
+        .tracks()
+        .values()
+        .find(|track| track.media_type().ok() == Some(mp4::MediaType::H264))
+        .ok_or("This video codec is not supported yet")?;
+    if track.width() == 0
+        || track.height() == 0
+        || track.width() > 1920
+        || track.height() > 1920
+        || track.timescale() == 0
+    {
+        return Err("This video exceeds the playback limit".into());
+    }
+    let avc = track
+        .trak
+        .mdia
+        .minf
+        .stbl
+        .stsd
+        .avc1
+        .as_ref()
+        .ok_or("Missing video configuration")?;
+    let mut header = Vec::new();
+    for parameter in [
+        &avc.avcc.sequence_parameter_sets,
+        &avc.avcc.picture_parameter_sets,
+    ] {
+        for nal in parameter {
+            header.extend_from_slice(&[0, 0, 0, 1]);
+            header.extend_from_slice(&nal.bytes);
+        }
+    }
+    let mut decoder = Decoder::new();
+    decoder
+        .decode(&header)
+        .map_err(|_| "Invalid video configuration")?;
+    let track_id = track.track_id();
+    let audio = parsed
+        .tracks()
+        .values()
+        .any(|track| track.media_type().ok() == Some(mp4::MediaType::AAC));
+    let trex = defaults.iter().find(|defaults| defaults.track == track_id);
+    let offset = if let Some(edits) = track
+        .trak
+        .edts
+        .as_ref()
+        .and_then(|edits| edits.elst.as_ref())
+    {
+        if edits.entries.len() > 1 {
+            return Err("Multiple video edit segments are not supported yet".into());
+        }
+        edits
+            .entries
+            .first()
+            .map(|edit| {
+                if edit.media_rate != 1
+                    || edit.media_rate_fraction != 0
+                    || edit.media_time > i64::MAX as u64
+                {
+                    Err::<u64, String>("This video edit is not supported yet".into())
+                } else {
+                    Ok(edit.media_time)
+                }
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    Ok(FragmentConfig {
+        decoder,
+        header,
+        track: track_id,
+        length: usize::from(avc.avcc.length_size_minus_one & 3) + 1,
+        scale: f64::from(track.timescale()),
+        default_duration: trex.map(|value| value.duration),
+        default_size: trex.map(|value| value.size),
+        default_flags: trex.map(|value| value.flags),
+        defaults,
+        offset,
+        audio,
+    })
+}
+
+fn fragment_plans<R: Read + Seek>(reader: &mut R, size: u64) -> Result<Vec<FragmentPlan>, String> {
+    let mut offset = 0u64;
+    let mut boxes = 0usize;
+    let mut segments_count = 0usize;
+    let mut plans = Vec::new();
+    while offset < size {
+        boxes += 1;
+        if boxes > 100_000 {
+            return Err("Video exceeds the box limit".into());
+        }
+        reader
+            .seek(SeekFrom::Start(offset))
+            .map_err(|_| "Could not seek video initialization")?;
+        let (kind, payload, end) = box_header(reader, offset, size)?;
+        if &kind == b"moof" {
+            break;
+        }
+        if &kind != b"sidx" {
+            offset = end;
+            continue;
+        }
+        let mut version_flags = [0; 4];
+        reader
+            .read_exact(&mut version_flags)
+            .map_err(|_| "Could not read video segment index")?;
+        let version = version_flags[0];
+        let reference_id = read_u32(reader)?;
+        let timescale = read_u32(reader)?;
+        if timescale == 0 {
+            return Err("Invalid video segment timescale".into());
+        }
+        let (earliest, first_offset) = match version {
+            0 => (u64::from(read_u32(reader)?), u64::from(read_u32(reader)?)),
+            1 => (read_u64(reader)?, read_u64(reader)?),
+            _ => return Err("Unsupported video segment index".into()),
+        };
+        let mut reserved_and_count = [0; 4];
+        reader
+            .read_exact(&mut reserved_and_count)
+            .map_err(|_| "Could not read video segment index")?;
+        let count = u16::from_be_bytes(reserved_and_count[2..].try_into().unwrap()) as usize;
+        let expected = 4u64
+            .checked_add(4)
+            .and_then(|value| value.checked_add(4))
+            .and_then(|value| value.checked_add(if version == 0 { 8 } else { 16 }))
+            .and_then(|value| value.checked_add(4))
+            .and_then(|value| value.checked_add((count as u64).saturating_mul(12)))
+            .ok_or("Invalid video segment index")?;
+        if count == 0 || count > 10_000 || expected > payload {
+            return Err("Invalid video segment index".into());
+        }
+        ensure_fragment_segment_limit(segments_count, count)?;
+        segments_count += count;
+        let mut position = end
+            .checked_add(first_offset)
+            .ok_or("Invalid video segment offset")?;
+        let mut time = earliest;
+        let mut segments = Vec::with_capacity(count);
+        for _ in 0..count {
+            let reference = read_u32(reader)?;
+            let duration = read_u32(reader)?;
+            let sap = read_u32(reader)?;
+            let length = u64::from(reference & 0x7fff_ffff);
+            let segment_end = position
+                .checked_add(length)
+                .filter(|end| *end <= size)
+                .ok_or("Invalid video segment offset")?;
+            if reference & 0x8000_0000 != 0 || length < 16 || duration == 0 {
+                return Err("Unsupported video segment index".into());
+            }
+            segments.push(FragmentSegment {
+                range: position..segment_end,
+                start: time,
+                duration: u64::from(duration),
+                starts_with_sap: sap & 0x8000_0000 != 0,
+            });
+            position = segment_end;
+            time = time
+                .checked_add(u64::from(duration))
+                .ok_or("Invalid video segment duration")?;
+        }
+        plans.push(FragmentPlan {
+            segments,
+            track: reference_id,
+            timescale,
+            origin: earliest,
+        });
+        offset = end;
+    }
+    Ok(plans)
+}
+
+fn ensure_fragment_segment_limit(current: usize, additional: usize) -> Result<(), String> {
+    if current
+        .checked_add(additional)
+        .is_none_or(|total| total > 100_000)
+    {
+        Err("Video exceeds the segment limit".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn segment_boxes<R: Read + Seek>(
+    reader: &mut R,
+    range: Range<u64>,
+) -> Result<SegmentBoxes, String> {
+    let mut offset = range.start;
+    let mut moofs = Vec::new();
+    let mut mdats = Vec::new();
+    let mut boxes = 0usize;
+    let mut samples = 0usize;
+    while offset < range.end {
+        boxes += 1;
+        if boxes > 100_000 {
+            return Err("Video segment exceeds the box limit".into());
+        }
+        reader
+            .seek(SeekFrom::Start(offset))
+            .map_err(|_| "Could not seek video segment")?;
+        let (kind, payload, end) = box_header(reader, offset, range.end)?;
+        let payload_start = reader
+            .stream_position()
+            .map_err(|_| "Could not read video segment")?;
+        match &kind {
+            b"moof" => {
+                validate_fragment_runs(reader, payload_start, end, None, &mut samples)?;
+                reader
+                    .seek(SeekFrom::Start(payload_start))
+                    .map_err(|_| "Could not seek video fragment")?;
+                let moof = mp4::MoofBox::read_box(reader, payload + 8)
+                    .map_err(|_| "Could not parse video fragment")?;
+                moofs.push((moof, offset));
+            }
+            b"mdat" => mdats.push(end - payload..end),
+            _ => {}
+        }
+        offset = end;
+    }
+    if moofs.is_empty() || mdats.is_empty() {
+        return Err("Video segment is missing media fragments".into());
+    }
+    Ok((moofs, mdats))
+}
+
+fn box_header<R: Read>(
+    reader: &mut R,
+    offset: u64,
+    limit: u64,
+) -> Result<([u8; 4], u64, u64), String> {
+    let mut header = [0; 8];
+    reader
+        .read_exact(&mut header)
+        .map_err(|_| "Could not read video box")?;
+    let short_size = u32::from_be_bytes(header[..4].try_into().unwrap());
+    let mut header_size = 8u64;
+    let size = if short_size == 1 {
+        header_size = 16;
+        read_u64(reader)?
+    } else if short_size == 0 {
+        limit - offset
+    } else {
+        u64::from(short_size)
+    };
+    let end = offset
+        .checked_add(size)
+        .filter(|end| size >= header_size && *end <= limit)
+        .ok_or("Invalid video box")?;
+    Ok((header[4..8].try_into().unwrap(), size - header_size, end))
+}
+
+fn read_u32<R: Read>(reader: &mut R) -> Result<u32, String> {
+    let mut bytes = [0; 4];
+    reader
+        .read_exact(&mut bytes)
+        .map_err(|_| "Could not read video segment index")?;
+    Ok(u32::from_be_bytes(bytes))
+}
+
+fn read_u64<R: Read>(reader: &mut R) -> Result<u64, String> {
+    let mut bytes = [0; 8];
+    reader
+        .read_exact(&mut bytes)
+        .map_err(|_| "Could not read video segment index")?;
+    Ok(u64::from_be_bytes(bytes))
+}
+
+fn top_level_boxes<R: Read + Seek>(
+    reader: &mut R,
+    size: u64,
+) -> Result<(Vec<u64>, Vec<Range<u64>>), String> {
+    let mut offset = 0u64;
+    let mut moofs = Vec::new();
+    let mut mdats = Vec::new();
+    let mut boxes = 0usize;
+    let mut samples = 0usize;
+    while offset < size {
+        boxes += 1;
+        if boxes > 100_000 {
+            return Err("Video exceeds the box limit".into());
+        }
+        reader
+            .seek(SeekFrom::Start(offset))
+            .map_err(|_| "Could not seek video fragments")?;
+        let mut header = [0; 8];
+        reader
+            .read_exact(&mut header)
+            .map_err(|_| "Could not read video fragments")?;
+        let short_size = u32::from_be_bytes(header[..4].try_into().unwrap());
+        let mut header_size = 8u64;
+        let box_size = if short_size == 1 {
+            let mut extended = [0; 8];
+            reader
+                .read_exact(&mut extended)
+                .map_err(|_| "Could not read video fragments")?;
+            header_size = 16;
+            u64::from_be_bytes(extended)
+        } else if short_size == 0 {
+            size - offset
+        } else {
+            u64::from(short_size)
+        };
+        let end = offset
+            .checked_add(box_size)
+            .filter(|end| box_size >= header_size && *end <= size)
+            .ok_or("Invalid video fragment box")?;
+        match &header[4..8] {
+            b"moof" => {
+                validate_fragment_runs(reader, offset + header_size, end, None, &mut samples)?;
+                moofs.push(offset);
+            }
+            b"mdat" => mdats.push(offset + header_size..end),
+            _ => {}
+        }
+        offset = end;
+    }
+    Ok((moofs, mdats))
+}
+
+fn ensure_fragment_sample_limit(current: usize, additional: usize) -> Result<(), String> {
+    if current
+        .checked_add(additional)
+        .is_none_or(|total| total > 1_000_000)
+    {
+        Err("Video exceeds the sample limit".into())
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn validate_fragment_runs<R: Read + Seek>(
+    reader: &mut R,
+    start: u64,
+    end: u64,
+    cancel: Option<&AtomicBool>,
+    samples: &mut usize,
+) -> Result<(), String> {
+    let mut child = start;
+    let mut boxes = 0usize;
+    while child < end {
+        if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+            return Err("Video fragment parsing cancelled".into());
+        }
+        boxes += 1;
+        if boxes > 100_000 {
+            return Err("Video fragment exceeds the box limit".into());
+        }
+        reader
+            .seek(SeekFrom::Start(child))
+            .map_err(|_| "Could not seek video fragment")?;
+        let (kind, _, child_end) = box_header(reader, child, end)?;
+        let payload_start = reader
+            .stream_position()
+            .map_err(|_| "Could not read video fragment")?;
+        if &kind == b"traf" {
+            let mut nested = payload_start;
+            let mut runs = 0usize;
+            while nested < child_end {
+                if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+                    return Err("Video fragment parsing cancelled".into());
+                }
+                boxes += 1;
+                if boxes > 100_000 {
+                    return Err("Video fragment exceeds the box limit".into());
+                }
+                reader
+                    .seek(SeekFrom::Start(nested))
+                    .map_err(|_| "Could not seek video fragment")?;
+                let (nested_kind, _, nested_end) = box_header(reader, nested, child_end)?;
+                if &nested_kind == b"trun" {
+                    runs += 1;
+                    if runs > 1 {
+                        return Err("Multiple video fragment runs are not supported".into());
+                    }
+                    let payload = reader
+                        .stream_position()
+                        .map_err(|_| "Could not read video fragment")?;
+                    if nested_end - payload < 8 {
+                        return Err("Invalid video fragment run".into());
+                    }
+                    let mut header = [0; 8];
+                    reader
+                        .read_exact(&mut header)
+                        .map_err(|_| "Could not read video fragment")?;
+                    let sample_count =
+                        u32::from_be_bytes(header[4..8].try_into().unwrap()) as usize;
+                    if sample_count > 100_000 {
+                        return Err("Video fragment exceeds the sample limit".into());
+                    }
+                    ensure_fragment_sample_limit(*samples, sample_count)?;
+                    *samples += sample_count;
+                }
+                nested = nested_end;
+            }
+        }
+        child = child_end;
+    }
+    Ok(())
+}
+
+fn annex_b(bytes: &[u8], length: usize) -> Result<(Vec<u8>, bool), String> {
     let mut output = Vec::with_capacity(bytes.len() + 32);
     let mut cursor = 0usize;
+    let mut idr = false;
     while cursor < bytes.len() {
         let size = bytes
             .get(cursor..cursor + length)
@@ -192,11 +1403,13 @@ fn annex_b(bytes: &[u8], length: usize) -> Result<Vec<u8>, String> {
             .fold(0usize, |size, byte| (size << 8) | usize::from(*byte));
         cursor += length;
         let end = cursor.checked_add(size).ok_or("Invalid video packet")?;
+        let nal = bytes.get(cursor..end).ok_or("Truncated video packet")?;
+        idr |= nal.first().is_some_and(|byte| byte & 0x1f == 5);
         output.extend_from_slice(&[0, 0, 0, 1]);
-        output.extend_from_slice(bytes.get(cursor..end).ok_or("Truncated video packet")?);
+        output.extend_from_slice(nal);
         cursor = end;
     }
-    Ok(output)
+    Ok((output, idr))
 }
 
 fn pixels(frame: rusty_h264_common::types::YuvFrame) -> Result<Pixels, String> {
@@ -239,4 +1452,208 @@ fn pixels(frame: rusty_h264_common::types::YuvFrame) -> Result<Pixels, String> {
         width,
         height,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn macroscope_aggregate_fragment_sample_limit() {
+        assert!(ensure_fragment_sample_limit(900_000, 100_000).is_ok());
+        assert_eq!(
+            ensure_fragment_sample_limit(900_001, 100_000).unwrap_err(),
+            "Video exceeds the sample limit"
+        );
+    }
+
+    #[test]
+    fn macroscope_fragment_sample_limit_spans_moofs() {
+        let mut source = include_bytes!("../tests/fixtures/fragmented.mp4").to_vec();
+        let moof_kind = source
+            .windows(4)
+            .position(|value| value == b"moof")
+            .unwrap();
+        let moof_start = moof_kind - 4;
+        let moof_size =
+            u32::from_be_bytes(source[moof_start..moof_start + 4].try_into().unwrap()) as usize;
+        let trun = source[moof_start..moof_start + moof_size]
+            .windows(4)
+            .position(|value| value == b"trun")
+            .map(|position| moof_start + position)
+            .unwrap();
+        source[trun + 8..trun + 12].copy_from_slice(&100_000u32.to_be_bytes());
+        let mut reader = std::io::Cursor::new(source);
+        let mut samples = 0usize;
+        for _ in 0..10 {
+            validate_fragment_runs(
+                &mut reader,
+                (moof_start + 8) as u64,
+                (moof_start + moof_size) as u64,
+                None,
+                &mut samples,
+            )
+            .unwrap();
+        }
+        let error = validate_fragment_runs(
+            &mut reader,
+            (moof_start + 8) as u64,
+            (moof_start + moof_size) as u64,
+            None,
+            &mut samples,
+        )
+        .unwrap_err();
+        assert_eq!(error, "Video exceeds the sample limit");
+    }
+
+    #[test]
+    fn macroscope_aggregate_fragment_segment_limit() {
+        assert!(ensure_fragment_segment_limit(90_000, 10_000).is_ok());
+        assert_eq!(
+            ensure_fragment_segment_limit(90_001, 10_000).unwrap_err(),
+            "Video exceeds the segment limit"
+        );
+    }
+
+    #[test]
+    fn macroscope_indexed_seek_uses_sap_boundaries() {
+        let segment = |start, starts_with_sap| FragmentSegment {
+            range: start..start + 1,
+            start,
+            duration: 1,
+            starts_with_sap,
+        };
+        let segments = [
+            segment(0, true),
+            segment(1, false),
+            segment(2, false),
+            segment(3, true),
+            segment(4, false),
+        ];
+        assert_eq!(indexed_seek_segment(&segments, 2.), 0);
+        assert_eq!(indexed_seek_segment(&segments, 3.), 0);
+        assert_eq!(indexed_seek_segment(&segments, 4.), 3);
+    }
+
+    #[test]
+    fn macroscope_fragment_config_preserves_audio() {
+        let bytes = include_bytes!("../tests/fixtures/audio-video.mp4");
+        let parsed =
+            mp4::Mp4Reader::read_header(std::io::Cursor::new(bytes), bytes.len() as u64).unwrap();
+        assert!(fragment_config(&parsed, Vec::new()).unwrap().audio);
+    }
+
+    #[test]
+    fn macroscope_segment_boxes_accept_extended_moof() {
+        let source = include_bytes!("../tests/fixtures/fragmented.mp4");
+        let moof_kind = source
+            .windows(4)
+            .position(|value| value == b"moof")
+            .unwrap();
+        let moof_start = moof_kind - 4;
+        let moof_size =
+            u32::from_be_bytes(source[moof_start..moof_start + 4].try_into().unwrap()) as usize;
+        let mdat_start = moof_start + moof_size;
+        let mdat_size =
+            u32::from_be_bytes(source[mdat_start..mdat_start + 4].try_into().unwrap()) as usize;
+        let mut pair = source[moof_start..mdat_start + mdat_size].to_vec();
+        let trun = pair.windows(4).position(|value| value == b"trun").unwrap();
+        let data_offset = trun + 12;
+        let value = i32::from_be_bytes(pair[data_offset..data_offset + 4].try_into().unwrap());
+        pair[data_offset..data_offset + 4].copy_from_slice(&(value + 8).to_be_bytes());
+        let mut extended = Vec::with_capacity(pair.len() + 8);
+        extended.extend_from_slice(&1u32.to_be_bytes());
+        extended.extend_from_slice(b"moof");
+        extended.extend_from_slice(&((moof_size + 8) as u64).to_be_bytes());
+        extended.extend_from_slice(&pair[8..]);
+        let range = 0..extended.len() as u64;
+        let (moofs, mdats) = segment_boxes(&mut std::io::Cursor::new(extended), range).unwrap();
+        assert_eq!(moofs.len(), 1);
+        assert_eq!(mdats.len(), 1);
+    }
+
+    #[test]
+    fn macroscope_fragment_offsets_follow_previous_traf() {
+        let source = include_bytes!("../tests/fixtures/fragmented.mp4");
+        let moof_kind = source
+            .windows(4)
+            .position(|value| value == b"moof")
+            .unwrap();
+        let moof_start = moof_kind - 4;
+        let moof_size =
+            u32::from_be_bytes(source[moof_start..moof_start + 4].try_into().unwrap()) as usize;
+        let mdat_start = moof_start + moof_size;
+        let mdat_size =
+            u32::from_be_bytes(source[mdat_start..mdat_start + 4].try_into().unwrap()) as usize;
+        let range = moof_start as u64..(mdat_start + mdat_size) as u64;
+        let (mut moofs, _) = segment_boxes(&mut std::io::Cursor::new(source), range).unwrap();
+        let mut moof = moofs.remove(0).0;
+        let mut audio = moof.trafs[0].clone();
+        audio.tfhd.track_id = 1;
+        audio.tfhd.flags = 0;
+        audio.tfhd.base_data_offset = None;
+        let audio_run = audio.trun.as_mut().unwrap();
+        audio_run.sample_count = 2;
+        audio_run.data_offset = Some(100);
+        audio_run.sample_sizes = vec![4, 6];
+        let mut video = audio.clone();
+        video.tfhd.track_id = 2;
+        let video_run = video.trun.as_mut().unwrap();
+        video_run.sample_count = 1;
+        video_run.data_offset = Some(5);
+        video_run.sample_sizes = vec![7];
+        moof.trafs = vec![audio, video];
+        assert_eq!(fragment_data_start(&moof, 1, 1000, &[]).unwrap(), 1115);
+        moof.trafs[1].trun.as_mut().unwrap().data_offset = None;
+        assert_eq!(fragment_data_start(&moof, 1, 1000, &[]).unwrap(), 1110);
+        moof.trafs[1].tfhd.flags = 0x020000;
+        assert_eq!(fragment_data_start(&moof, 1, 1000, &[]).unwrap(), 1000);
+        moof.trafs[1].tfhd.flags = 0;
+        moof.trafs[0].trun.as_mut().unwrap().sample_sizes.clear();
+        moof.trafs[0].tfhd.default_sample_size = None;
+        assert_eq!(
+            fragment_data_start(
+                &moof,
+                1,
+                1000,
+                &[TrackDefaults {
+                    track: 1,
+                    duration: 0,
+                    size: 5,
+                    flags: 0,
+                }],
+            )
+            .unwrap(),
+            1110
+        );
+    }
+
+    #[test]
+    fn macroscope_collects_all_track_fragment_defaults() {
+        let trex = |track: u32, size: u32| {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&32u32.to_be_bytes());
+            bytes.extend_from_slice(b"trex");
+            bytes.extend_from_slice(&[0; 4]);
+            bytes.extend_from_slice(&track.to_be_bytes());
+            bytes.extend_from_slice(&1u32.to_be_bytes());
+            bytes.extend_from_slice(&3000u32.to_be_bytes());
+            bytes.extend_from_slice(&size.to_be_bytes());
+            bytes.extend_from_slice(&0x10000u32.to_be_bytes());
+            bytes
+        };
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&80u32.to_be_bytes());
+        bytes.extend_from_slice(b"moov");
+        bytes.extend_from_slice(&72u32.to_be_bytes());
+        bytes.extend_from_slice(b"mvex");
+        bytes.extend_from_slice(&trex(1, 5));
+        bytes.extend_from_slice(&trex(2, 7));
+        let defaults = fragment_defaults(&mut std::io::Cursor::new(&bytes), 80).unwrap();
+        assert_eq!(defaults.len(), 2);
+        assert_eq!(defaults[0].track, 1);
+        assert_eq!(defaults[0].size, 5);
+        assert_eq!(defaults[1].track, 2);
+        assert_eq!(defaults[1].size, 7);
+    }
 }

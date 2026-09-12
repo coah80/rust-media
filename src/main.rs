@@ -1,5 +1,6 @@
 use rust_media::{
-    decode::Video,
+    audio::Audio,
+    decode::MediaVideo,
     player::{MediaReader, Player, Status},
     providers,
 };
@@ -13,25 +14,48 @@ slint::include_modules!();
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
-    if args.first().is_some_and(|arg| arg == "--probe") {
+    if args
+        .first()
+        .is_some_and(|arg| matches!(arg.as_str(), "--probe" | "--probe-all"))
+    {
+        let full = args[0] == "--probe-all";
         let input = args
             .get(1)
-            .ok_or("Usage: rust-media --probe <video URL or file>")?;
+            .ok_or(
+                "Usage: rust-media --probe <video URL or file> or rust-media --probe-all <video URL or file>",
+            )?;
         let start = Instant::now();
         let resolved = providers::resolve(input)?;
-        let source = MediaReader::open(&resolved.video, Arc::default())?;
+        let (source, audio_source) = MediaReader::resolved(&resolved, Arc::default())?;
+        let progress = source.progress();
+        let audio_progress = audio_source.as_ref().and_then(MediaReader::progress);
+        let buffered = || match (&progress, &audio_progress) {
+            (Some(video), Some(audio)) => video.fraction().min(audio.fraction()),
+            (Some(progress), None) | (None, Some(progress)) => progress.fraction(),
+            (None, None) => 1.,
+        };
         let size = source.size();
-        let mut decoder = Video::new(source, size)?;
+        let mut decoder = if resolved.fragmented {
+            MediaVideo::fragmented(source.duplicate()?, source.duplicate()?, size)?
+        } else {
+            MediaVideo::open(source.duplicate()?, source.duplicate()?, size)?
+        };
         let mut count = 0;
         let mut first = None;
         let mut last = 0.;
         let mut checksum = 0u64;
-        while count < 60 {
+        let mut first_frame_wall = 0.;
+        let mut first_frame_buffered = 0.;
+        while full || count < 60 {
             let Some((pts, frame)) = decoder.frame()? else {
                 break;
             };
             if pts < last {
                 return Err("Frame timestamps are out of order".into());
+            }
+            if count == 0 {
+                first_frame_wall = start.elapsed().as_secs_f64();
+                first_frame_buffered = buffered();
             }
             last = pts;
             first.get_or_insert((frame.width, frame.height));
@@ -43,13 +67,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if count == 0 {
             return Err("Video contains no decodable frames".into());
         }
+        let audio_samples = if full && (decoder.has_audio() || audio_source.is_some()) {
+            let mut audio = Audio::new(audio_source.unwrap_or(source))?;
+            let samples = audio.by_ref().count();
+            if let Some(error) = audio.error.lock().unwrap().as_ref() {
+                return Err(error.clone().into());
+            }
+            samples
+        } else {
+            0
+        };
         println!(
-            "provider={} frames={} dimensions={:?} duration={:.3}s last_pts={:.3}s decode_wall={:.3}s checksum={checksum:016x}",
+            "provider={} progressive={} frames={} audio_samples={} dimensions={:?} duration={:.3}s last_pts={:.3}s first_frame_wall={:.3}s first_frame_buffered={:.3} buffered={:.3} decode_wall={:.3}s checksum={checksum:016x}",
             resolved.provider,
+            resolved.progressive,
             count,
+            audio_samples,
             first.unwrap(),
-            decoder.duration,
+            decoder.duration(),
             last,
+            first_frame_wall,
+            first_frame_buffered,
+            buffered(),
             start.elapsed().as_secs_f64()
         );
         return Ok(());
@@ -109,6 +148,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ui.set_error(state.error.into());
             ui.set_position(state.position as f32);
             ui.set_duration(state.duration as f32);
+            ui.set_buffered(state.buffered as f32);
             ui.set_status(match state.status {
                 Status::Idle => 0,
                 Status::Loading => 1,

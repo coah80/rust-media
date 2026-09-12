@@ -4,9 +4,16 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.92"
 publish = false
+description = "Native Rust H.264/AAC playback with progressive MP4 streaming"
+license = "MIT"
+repository = "https://github.com/coah80/rust-media"
+readme = "README.md"
+keywords = ["video", "media", "mp4", "h264", "playback"]
+categories = ["multimedia::video", "multimedia::audio"]
+include = ["/src/**", "/ui/**", "/examples/**", "/tests/**", "/docs/**", "/build.rs", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE", "/THIRD_PARTY.md", "/CONTRIBUTING.md"]
 
 [features]
-default = ["native"]
+default = []
 native = ["dep:slint", "dep:slint-build", "dep:lucide-slint"]
 
 [[bin]]
@@ -16,12 +23,18 @@ required-features = ["native"]
 
 [dependencies]
 mp4 = "0.14"
-rusty_h264-decoder = { version = "=0.16.0", default-features = false, features = ["std", "global-alloc"] }
-rusty_h264-common = { version = "=0.16.0", default-features = false, features = ["std", "global-alloc"] }
+rusty_h264-decoder = { version = "=0.16.0", default-features = false, features = ["std"] }
+rusty_h264-common = { version = "=0.16.0", default-features = false, features = ["std"] }
 rodio = { version = "0.22.2", default-features = false, features = ["playback", "mp4"] }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "cookies", "json", "rustls-tls"] }
 serde_json = "1"
 slint = { version = "=1.17.1", optional = true, default-features = false, features = ["std", "backend-winit", "renderer-software", "renderer-femtovg", "accessibility", "compat-1-2"] }
+base64 = "0.22"
+ytdlp-ejs = { git = "https://github.com/ahaoboy/ytdlp-ejs", rev = "03399fa26ee36c823b9fb4fc0125381e9e968733", default-features = false, features = ["boa"] }
+prost = "0.13"
+boa_engine = "0.22"
+symphonia = { version = "0.5.5", default-features = false, features = ["aac", "isomp4"] }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "macros"] }
 
 [build-dependencies]
 slint-build = { version = "=1.17.1", optional = true }
@@ -33,6 +46,12 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.rust-media]
 opt-level = 2
+[profile.dev.package.boa_parser]
+opt-level = 3
+[profile.dev.package.boa_engine]
+opt-level = 3
+[profile.dev.package.ytdlp-ejs]
+opt-level = 3
 
 [profile.release]
 lto = "thin"
