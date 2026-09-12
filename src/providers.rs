@@ -77,6 +77,10 @@ pub fn resolve_with_cancel(input: &str, cancel: Arc<AtomicBool>) -> Result<Resol
         ),
         "fixupx.com" | "www.fixupx.com" | "fxtwitter.com" | "www.fxtwitter.com" | "x.com"
         | "twitter.com" => fixtweet(&status_id(&url).ok_or("Invalid post link")?, &cancel),
+        "streamable.com" | "www.streamable.com" => streamable(
+            streamable_id(&url).ok_or("Invalid Streamable video link")?,
+            &cancel,
+        ),
         _ if crate::http::allowed(input) => Ok(Resolved {
             video: input.into(),
             audio: None,
@@ -106,6 +110,87 @@ fn status_id(url: &reqwest::Url) -> Option<String> {
     let id = *segments.get(index + 1)?;
     (id.len() <= 24 && !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
         .then(|| id.into())
+}
+
+fn streamable_id(url: &reqwest::Url) -> Option<&str> {
+    let path = url.path().strip_prefix('/')?;
+    let id = path
+        .strip_prefix("e/")
+        .or_else(|| path.strip_prefix("o/"))
+        .unwrap_or(path);
+    let id = id.strip_suffix('/').unwrap_or(id);
+    (!id.is_empty() && id.len() <= 32 && id.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .then_some(id)
+}
+
+fn streamable(id: &str, cancel: &AtomicBool) -> Result<Resolved, String> {
+    let bytes = fetch(&format!("https://api.streamable.com/videos/{id}"), cancel)?;
+    let value: Value = serde_json::from_slice(&bytes).map_err(|_| "Invalid Streamable response")?;
+    parse_streamable(&value)
+}
+
+fn parse_streamable(value: &Value) -> Result<Resolved, String> {
+    if value["status"].as_u64() != Some(2) {
+        return Err("This Streamable video is unavailable or still processing".into());
+    }
+    let files = value["files"]
+        .as_object()
+        .ok_or("Invalid Streamable response")?;
+    let video = files
+        .iter()
+        .filter_map(|(format, file)| {
+            if !(format == "mp4" || format.starts_with("mp4-"))
+                || file["status"].as_u64() != Some(2)
+            {
+                return None;
+            }
+            let width = file["width"].as_u64()?;
+            let height = file["height"].as_u64()?;
+            if width == 0
+                || height == 0
+                || width > 1920
+                || height > 1920
+                || file["size"]
+                    .as_u64()
+                    .is_some_and(|size| size > 2 * 1024 * 1024 * 1024)
+            {
+                return None;
+            }
+            let raw = file["url"].as_str()?;
+            let url = if raw.starts_with("//") {
+                format!("https:{raw}")
+            } else {
+                raw.into()
+            };
+            let parsed = reqwest::Url::parse(&url).ok()?;
+            if !crate::http::allowed(&url)
+                || !parsed.host_str().is_some_and(crate::http::streamable_cdn)
+                || !parsed.path().ends_with(".mp4")
+            {
+                return None;
+            }
+            let fits_output = width.max(height) <= 1280 && width.min(height) <= 720;
+            Some((
+                (
+                    fits_output,
+                    width * height,
+                    file["bitrate"].as_u64().unwrap_or(0),
+                ),
+                url,
+            ))
+        })
+        .max_by_key(|(rank, _)| *rank)
+        .map(|(_, url)| url)
+        .ok_or("Streamable did not provide a supported MP4 stream")?;
+    Ok(Resolved {
+        video,
+        audio: None,
+        title: value["title"].as_str().unwrap_or("Video").into(),
+        provider: "Streamable".into(),
+        prepared: None,
+        progressive: false,
+        fragmented: false,
+    })
 }
 
 fn fixtweet(id: &str, cancel: &AtomicBool) -> Result<Resolved, String> {
@@ -439,6 +524,81 @@ fn youtube_stream_error(data: &Value) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn streamable_links_reject_extra_paths_and_encoded_ids() {
+        for path in ["/abc123", "/e/abc123", "/o/abc123/", "/abc123?src=player"] {
+            let url = format!("https://streamable.com{path}").parse().unwrap();
+            assert_eq!(super::streamable_id(&url), Some("abc123"));
+        }
+        for path in [
+            "/",
+            "/e/",
+            "/abc/other",
+            "/%61bc",
+            "/abc.mp4",
+            "/e/abc/other",
+        ] {
+            let url = format!("https://streamable.com{path}").parse().unwrap();
+            assert_eq!(super::streamable_id(&url), None);
+        }
+    }
+
+    fn streamable_fixture() -> serde_json::Value {
+        serde_json::json!({"status": 2, "title": "Fixture", "files": {
+            "mp4": {"status": 2, "url": "//cdn-cf-east.streamable.com/video/mp4/abc.mp4?signature=fixture", "width": 1280, "height": 720},
+            "mp4-mobile": {"status": 2, "url": "https://cdn-b-east.streamable.com/video/mp4-mobile/abc.mp4", "width": 640, "height": 360}
+        }})
+    }
+
+    #[test]
+    fn streamable_metadata_cannot_redirect_to_untrusted_media() {
+        for url in [
+            "https://127.0.0.1/abc.mp4",
+            "https://cdn-cf-east.streamable.com.evil.test/abc.mp4",
+            "https://evil.cdn-cf-east.streamable.com/abc.mp4",
+            "https://streamable.com/abc.mp4",
+            "https://user@cdn-cf-east.streamable.com/abc.mp4",
+            "https://cdn-cf-east.streamable.com:444/abc.mp4",
+            "http://cdn-cf-east.streamable.com/abc.mp4",
+            "https://video.twimg.com/abc.mp4",
+            "https://cdn-cf-east.streamable.com/abc.m3u8",
+        ] {
+            let mut value = streamable_fixture();
+            value["files"].as_object_mut().unwrap().remove("mp4-mobile");
+            value["files"]["mp4"]["url"] = url.into();
+            assert!(super::parse_streamable(&value).is_err(), "accepted {url}");
+        }
+        let resolved = super::parse_streamable(&streamable_fixture()).unwrap();
+        assert!(
+            resolved
+                .video
+                .starts_with("https://cdn-cf-east.streamable.com/")
+        );
+        assert!(!resolved.progressive);
+        assert!(resolved.prepared.is_none());
+    }
+
+    #[test]
+    fn streamable_rejects_oversized_and_unready_variants() {
+        let mut value = streamable_fixture();
+        value["files"]["mp4"]["width"] = 3840.into();
+        assert!(
+            super::parse_streamable(&value)
+                .unwrap()
+                .video
+                .contains("mp4-mobile")
+        );
+        value["files"]["mp4-mobile"]["size"] = (2_u64 * 1024 * 1024 * 1024 + 1).into();
+        assert!(super::parse_streamable(&value).is_err());
+        value = streamable_fixture();
+        value["status"] = 1.into();
+        assert!(super::parse_streamable(&value).is_err());
+        value["status"] = 2.into();
+        value["files"]["mp4"]["status"] = 1.into();
+        value["files"]["mp4-mobile"]["status"] = 1.into();
+        assert!(super::parse_streamable(&value).is_err());
+    }
+
     #[test]
     fn debug_output_omits_signed_urls_and_titles() {
         let resolved = super::Resolved {

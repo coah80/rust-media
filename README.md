@@ -41,7 +41,7 @@ cd rust-media
 cargo run --release --locked --features native -- path/to/clip.mp4
 ```
 
-Pass a YouTube or FixupX URL instead of a file path, or run without an argument to paste one into the window. The player includes seeking, volume, mute, fullscreen, and a buffered-progress bar.
+Pass a YouTube, Streamable, or FixupX URL instead of a file path, or run without an argument to paste one into the window. The player includes seeking, volume, mute, fullscreen, and a buffered-progress bar.
 
 Space pauses or resumes. Left and Right seek five seconds. M mutes, F toggles fullscreen, and Escape exits fullscreen.
 
@@ -54,6 +54,7 @@ Windows builds need the MSVC toolchain. macOS needs Xcode command-line tools. Li
 | Local files | H.264 MP4/MOV, including fragmented MP4, with optional AAC audio |
 | Direct media URLs | HTTPS MP4 from the [supported media hosts](src/http.rs), including Discord CDN and Twitter video |
 | FixupX / FxTwitter | First video in a public post |
+| Streamable | Public share and embed links with an available MP4 stream; see [integration details](docs/streamable.md) |
 | YouTube | Public recorded videos that provide H.264/AAC, up to 20 minutes and 128 MiB of combined media |
 
 Video decoding uses the CPU. Input dimensions are limited to 1920 pixels on either side, and output frames fit within 1280 × 720. Local and ordinary direct files are limited to 2 GiB. Individual compressed samples are limited to 8 MiB.
