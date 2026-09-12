@@ -148,12 +148,11 @@ fn copy_block_scalar(
         ($k:literal) => {{
             for y in 0..h {
                 let (d, s) = (y * dst_stride, y * src_stride);
-                if let (Some(a), Some(b)) = (
-                    dst[d..].first_chunk_mut::<$k>(),
-                    src[s..].first_chunk::<$k>(),
-                ) {
-                    *a = *b;
-                }
+                let a = dst[d..]
+                    .first_chunk_mut::<$k>()
+                    .expect("Short copy destination row");
+                let b = src[s..].first_chunk::<$k>().expect("Short copy source row");
+                *a = *b;
             }
             return;
         }};

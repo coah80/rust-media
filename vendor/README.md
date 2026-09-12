@@ -7,3 +7,5 @@ The upstream luma deblocking bounds check requires `x >= 4` for both edge direct
 The manifests include only library targets and point the decoder at the local accelerator crate. Source formatting follows rustfmt. The upstream command-line program, integration fixtures, and package metadata are omitted.
 
 These are direct path dependencies so the fix also applies when another app depends on Rust Media. Remove these copies when a verified upstream release includes the fix.
+
+PR review fixes also reject unsupported HEVC sample depths, check long-term reference indexes and coefficient arithmetic, reject short copy rows, and restrict tiled SIMD dispatch to compatible dimensions. Scalar fallbacks remain usable when sample values exceed SIMD arithmetic limits. Kernel coverage now uses observed output changes, profiling stops count once, and disabled diagnostics avoid hot-loop lookups. Documentation attributes and target-specific compilation guards were corrected.

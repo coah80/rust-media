@@ -52,6 +52,14 @@ impl Decoder for Hevc {
             return Err(Error::Unsupported("HEVC requires 4:2:0 chroma".into()));
         }
         dimensions(w as u32, h as u32).map_err(Error::InvalidData)?;
+        if !matches!(
+            (picture.bit_depth_luma, picture.bit_depth_chroma),
+            (8, 8) | (10, 10)
+        ) {
+            return Err(Error::Unsupported(
+                "HEVC requires matching 8-bit or 10-bit samples".into(),
+            ));
+        }
         let wide = picture.bit_depth_luma == 10;
         let mut planes = Vec::new();
         let mut strides = Vec::new();
@@ -1084,6 +1092,26 @@ mod limits {
             pts: Some(0),
         };
         assert!(pixels(&frame).is_err());
+    }
+
+    #[test]
+    fn hevc_prediction_tiles_preserve_nonstandard_block_shapes() {
+        use rusty_h265::accel::intra::{angular, angular_t, transpose};
+        for n in [4, 5, 8, 12, 16, 24, 32] {
+            let reference: Vec<i16> = (0..4 * n + 16).map(|i| (i % 256) as i16).collect();
+            let mut rows = vec![0; n * n];
+            let mut columns = rows.clone();
+            angular(&mut rows, n, n, &reference, n, 13, 255);
+            angular_t(&mut columns, n, n, &reference, n, 13, 255);
+            let mut transposed = vec![0; n * n];
+            transpose(&mut transposed, n, &rows, n, n);
+            for y in 0..n {
+                for x in 0..n {
+                    assert_eq!(transposed[y * n + x], rows[x * n + y]);
+                }
+            }
+            assert_eq!(columns, transposed, "block width {n}");
+        }
     }
 
     #[test]

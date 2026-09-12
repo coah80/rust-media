@@ -350,7 +350,9 @@ pub fn parse_slice_header<'a>(
                         } else {
                             0
                         };
-                        sps.lt_ref_pics[idx]
+                        *sps.lt_ref_pics
+                            .get(idx)
+                            .ok_or_else(|| Error::invalid("lt_idx_sps out of range"))?
                     } else {
                         let lsb = r.read_bits(sps.log2_max_poc_lsb as u32)?;
                         (lsb, r.read_flag()?)

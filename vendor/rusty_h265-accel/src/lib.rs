@@ -166,6 +166,11 @@ pub fn isa() -> Isa {
 /// the comparison into a null arm without saying so. A harness that wants to
 /// measure AVX2 against SSE4.1 needs this.
 pub fn force_isa(cap: Isa) {
+    #[cfg(all(feature = "simd", any(target_arch = "x86_64", target_arch = "aarch64")))]
+    assert!(
+        cap != Isa::Scalar,
+        "Scalar HEVC decoding requires a build without the simd feature"
+    );
     #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     detect::force_cap(match cap {
         Isa::Scalar | Isa::Baseline => 0,

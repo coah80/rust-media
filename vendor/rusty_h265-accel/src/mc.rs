@@ -1519,6 +1519,7 @@ fn fir_h<const N: usize>(
     dst: &mut [i16],
     dst_stride: usize,
 ) {
+    let _ = p;
     debug_assert!(src.len() >= stride * (h - 1) + w + N - 1);
     debug_assert!(dst.len() >= dst_stride * (h - 1) + w);
     #[cfg(all(feature = "simd", target_arch = "x86_64"))]
@@ -1589,8 +1590,6 @@ fn as_i16(s: &[u16]) -> &[i16] {
     unsafe { std::slice::from_raw_parts(s.as_ptr().cast::<i16>(), s.len()) }
 }
 
-/// Vertical FIR straight off the reference plane (the `fx == 0` case).
-#[inline]
 /// True when the tap set is a palindrome, so the mirrored operands can be
 /// folded with a `paddw` before the multiply. Two of HEVC's filters are:
 /// luma `f2` and chroma `fC4`.
@@ -1721,6 +1720,8 @@ fn fir_v_u16_sym<const N: usize>(
     fir_v_u16::<N>(p, src, stride, t, w, h, shift, dst, dst_stride);
 }
 
+/// Vertical FIR straight off the reference plane (the `fx == 0` case).
+#[inline]
 fn fir_v_u16<const N: usize>(
     p: McPlan,
     src: &[u16],
@@ -1754,6 +1755,7 @@ fn fir_v<const N: usize>(
     dst: &mut [i16],
     dst_stride: usize,
 ) {
+    let _ = p;
     debug_assert!(src.len() >= stride * (h + N - 2) + w);
     #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     {

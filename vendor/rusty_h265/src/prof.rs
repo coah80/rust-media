@@ -164,6 +164,7 @@ impl Scope {
         if count {
             CALLS[stage].fetch_add(1, Ordering::Relaxed);
         }
+        std::mem::forget(self);
     }
 
     #[inline(always)]

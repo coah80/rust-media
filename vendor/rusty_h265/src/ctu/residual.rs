@@ -614,7 +614,7 @@ impl<'a> SliceDecoder<'a> {
                 .wrapping_shl(32 - nsigns as u32);
             // coeff_abs_level_remaining
             let mut rice = 0u32;
-            let mut sum_abs = 0i32;
+            let mut sum_abs = 0i64;
             for k in 0..nsig {
                 let np = sig_pos[k & 15] as usize;
                 let is_g2_pos = first_g2 == np;
@@ -631,7 +631,9 @@ impl<'a> SliceDecoder<'a> {
                 let mut abs = base;
                 if base == threshold {
                     let rem = Self::coeff_remaining(cab, rice)?;
-                    abs += rem;
+                    abs = abs
+                        .checked_add(rem)
+                        .ok_or_else(|| Error::invalid("coefficient level overflow"))?;
                     if abs > 3 * (1 << rice) {
                         rice = (rice + 1).min(4);
                     }
@@ -640,7 +642,7 @@ impl<'a> SliceDecoder<'a> {
                 sbits <<= 1;
                 let mut v = if neg { -abs } else { abs };
                 if sign_hidden {
-                    sum_abs += abs;
+                    sum_abs += i64::from(abs);
                     if k == nsig - 1 && sum_abs & 1 == 1 {
                         v = -v;
                     }
@@ -669,7 +671,8 @@ impl<'a> SliceDecoder<'a> {
             if l + rice > 31 {
                 return Err(Error::invalid("coeff_abs_level_remaining suffix"));
             }
-            Ok(((((1u32 << l) + 2) << rice) + cab.bypass_bits(l + rice)) as i32)
+            let total = (((1u64 << l) + 2) << rice) + u64::from(cab.bypass_bits(l + rice));
+            i32::try_from(total).map_err(|_| Error::invalid("coeff_abs_level_remaining overflow"))
         }
     }
 

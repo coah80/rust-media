@@ -428,6 +428,11 @@ fn filter_chroma_edge(
     }
 }
 
+fn saobytes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RH265_SAOBYTES").is_some())
+}
+
 /// Bring-up switch: `RH265_SCALAR_SAO=1` keeps SAO on the scalar reference
 /// loops. Both arms of the kernel A/B are then the SAME binary, which removes
 /// the build-difference and stale-binary questions from the measurement.
@@ -525,7 +530,7 @@ fn sao(
         {
             crate::prof_scope!(crate::prof::Stage::SaoCopy);
             let need = planes[c].data.len();
-            if std::env::var_os("RH265_SAOBYTES").is_some() {
+            if saobytes() {
                 SAO_PLANE.fetch_add(need as u64, std::sync::atomic::Ordering::Relaxed);
             }
             if scratch.len() < need {
@@ -573,7 +578,7 @@ fn sao(
                         scratch[a..a + w].copy_from_slice(&planes[c].data[a..a + w]);
                     }
                 }
-                if std::env::var_os("RH265_SAOBYTES").is_some() {
+                if saobytes() {
                     SAO_COPIED.fetch_add(
                         ((y1 - y0) * (hi - lo)) as u64,
                         std::sync::atomic::Ordering::Relaxed,

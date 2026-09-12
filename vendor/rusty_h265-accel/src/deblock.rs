@@ -418,6 +418,7 @@ mod x86 {
 }
 
 /// Bring-up switch: `RH265_SCALAR_DEBLOCK=1` forces the scalar twin.
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
 fn scalar_deblock() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -577,6 +578,7 @@ mod tests {
                                         _ => (lcg(&mut st) & max as u32) as u16,
                                     };
                                 }
+                                let before = a.clone();
                                 let mut b = a.clone();
                                 let (x, y) = (20usize, 20usize);
                                 luma_edge_scalar(
@@ -584,10 +586,27 @@ mod tests {
                                 );
                                 luma_edge(&mut b, stride, x, y, dir, beta, tc, no_p, no_q, max);
                                 assert_eq!(a, b, "bd={bd} pat={pattern} beta={beta} tc={tc} dir={dir} no_p={no_p} no_q={no_q}");
-                                match pattern {
-                                    0 => strongs += 1,
-                                    1 | 2 => weaks += 1,
-                                    _ => skips += 1,
+                                let changed = (0..4)
+                                    .map(|line| {
+                                        (-3..=2)
+                                            .filter(|&tap| {
+                                                let at = if dir == 0 {
+                                                    (y + line) * stride
+                                                        + (x as isize + tap) as usize
+                                                } else {
+                                                    (y as isize + tap) as usize * stride + x + line
+                                                };
+                                                before[at] != b[at]
+                                            })
+                                            .count()
+                                    })
+                                    .max()
+                                    .unwrap_or(0);
+                                match changed {
+                                    0 => skips += 1,
+                                    6 => strongs += 1,
+                                    1..=4 => weaks += 1,
+                                    _ => {}
                                 }
                             }
                         }

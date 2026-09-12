@@ -383,6 +383,7 @@ mod x86 {
 /// One relaxed load for the whole decision, rather than an env lookup and an
 /// `isa()` probe on every one of millions of calls. `RH265_SCALAR_ITX` reports
 /// `Scalar`, which is how the bring-up switch and the ISA rung share a path.
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
 #[inline(always)]
 fn kernel_isa() -> crate::Isa {
     use std::sync::OnceLock;
@@ -397,6 +398,7 @@ fn kernel_isa() -> crate::Isa {
 }
 
 /// Whether any vector arm is available.
+#[cfg(all(feature = "simd", target_arch = "x86_64"))]
 #[inline(always)]
 fn use_kernel() -> bool {
     kernel_isa() >= crate::Isa::Sse41

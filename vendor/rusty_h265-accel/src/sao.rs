@@ -812,14 +812,6 @@ mod arm {
     }
 }
 
-/// Band offset over the rectangle at `(x0, y0)` of two same-shaped planes,
-/// `band` holding the 32-entry offset table (only four entries are non-zero).
-///
-/// Both slices are the WHOLE plane and the rectangle is named by its origin,
-/// rather than the caller passing `&plane[origin..]`. Band offset would survive
-/// either convention, but [`sao_edge`] reads a halo *before* the origin, so
-/// they share this one to keep the two call sites identical.
-#[allow(clippy::too_many_arguments)]
 /// The bias that makes SAO offsets non-negative inside the `pshufb` table.
 ///
 /// `pshufb` selects bytes, so the offsets are carried as `i8`. They are signed,
@@ -864,6 +856,14 @@ fn offsets_fit_lut(offs: &[i16]) -> bool {
     })
 }
 
+/// Band offset over the rectangle at `(x0, y0)` of two same-shaped planes,
+/// `band` holding the 32-entry offset table (only four entries are non-zero).
+///
+/// Both slices are the WHOLE plane and the rectangle is named by its origin,
+/// rather than the caller passing `&plane[origin..]`. Band offset would survive
+/// either convention, but [`sao_edge`] reads a halo *before* the origin, so
+/// they share this one to keep the two call sites identical.
+#[allow(clippy::too_many_arguments)]
 pub fn sao_band(
     dst: &mut [u16],
     src: &[u16],
@@ -877,11 +877,13 @@ pub fn sao_band(
     band: &[i16; 32],
     max: i32,
 ) {
-    let ok = w > 0 && h > 0 && offsets_fit_lut(band) && {
+    let _ = pos;
+    let valid_bounds = w > 0 && h > 0 && {
         let need = (y0 + h - 1) * stride + x0 + w;
         dst.len() >= need && src.len() >= need
     };
-    debug_assert!(ok);
+    debug_assert!(valid_bounds);
+    let ok = valid_bounds && offsets_fit_lut(band);
     if census::ALWAYS {
         let simd = cfg!(feature = "simd") && crate::isa() != crate::Isa::Scalar && ok;
         census::bump(
@@ -998,14 +1000,15 @@ pub fn sao_edge(
     max: i32,
 ) {
     let (oa, ob) = (doff(da, stride), doff(db, stride));
-    let ok = w > 0 && h > 0 && offsets_fit_lut(offs) && {
+    let valid_bounds = w > 0 && h > 0 && {
         let first = (y0 * stride + x0) as isize;
         let last = ((y0 + h - 1) * stride + x0 + w - 1) as isize;
         let lo = first + oa.min(ob).min(0);
         let hi = last + oa.max(ob).max(0);
         lo >= 0 && (hi as usize) < src.len() && (last as usize) < dst.len()
     };
-    debug_assert!(ok);
+    debug_assert!(valid_bounds);
+    let ok = valid_bounds && offsets_fit_lut(offs);
     if census::ALWAYS {
         let simd = cfg!(feature = "simd") && crate::isa() != crate::Isa::Scalar && ok;
         census::bump(

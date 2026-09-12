@@ -242,11 +242,13 @@ mod x86 {
             let row = unsafe { dst.add(i * dst_stride) };
             let src = unsafe { refb.add(base) };
             // Route: a whole-sample angle needs no filter at all, only a copy.
-            crate::census::route(
-                ifact == 0,
-                &crate::census::RT_INTRA_ANG_COPY,
-                &crate::census::RT_INTRA_ANG_ROW,
-            );
+            if crate::census::ALWAYS {
+                crate::census::route(
+                    ifact == 0,
+                    &crate::census::RT_INTRA_ANG_COPY,
+                    &crate::census::RT_INTRA_ANG_ROW,
+                );
+            }
             if ifact == 0 {
                 // A pure copy: no filter, so no arithmetic to vectorise beyond
                 // the move itself.
@@ -438,11 +440,13 @@ mod x86 {
             let base = (off as i32 + iidx + 1) as usize;
             let row = unsafe { dst.add(i * dst_stride) };
             let src = unsafe { refb.add(base) };
-            crate::census::route(
-                ifact == 0,
-                &crate::census::RT_INTRA_ANG_COPY,
-                &crate::census::RT_INTRA_ANG_ROW,
-            );
+            if crate::census::ALWAYS {
+                crate::census::route(
+                    ifact == 0,
+                    &crate::census::RT_INTRA_ANG_COPY,
+                    &crate::census::RT_INTRA_ANG_ROW,
+                );
+            }
             if ifact == 0 {
                 let nvec = n / 16;
                 for k in 0..nvec {
@@ -984,11 +988,6 @@ mod arm {
     }
 }
 
-/// Angular prediction (§8.4.4.2.6) into a **row-major** `n × n` block.
-///
-/// `refb[off + k]` is the reference at index `k`, `k` running `−n..=2n`. For
-/// modes below 18 the caller predicts into scratch and calls [`transpose`];
-/// the arithmetic is identical, only the orientation of the result differs.
 /// Whether the angular kernels' `i16` multiply is exact for samples bounded by
 /// `max`.
 ///
@@ -1011,6 +1010,11 @@ pub fn angular_i16_is_exact(max: i32) -> bool {
     31 * max <= i16::MAX as i32
 }
 
+/// Angular prediction (§8.4.4.2.6) into a **row-major** `n × n` block.
+///
+/// `refb[off + k]` is the reference at index `k`, `k` running `−n..=2n`. For
+/// modes below 18 the caller predicts into scratch and calls [`transpose`];
+/// the arithmetic is identical, only the orientation of the result differs.
 pub fn angular(
     dst: &mut [u16],
     dst_stride: usize,
@@ -1036,10 +1040,6 @@ pub fn angular(
         && dst.len() >= dst_stride * (n - 1) + n
         && refb.len() >= off + 2 * n + 9
         && angular_i16_is_exact(max);
-    debug_assert!(
-        !(4..=MAX_N).contains(&n) || angular_i16_is_exact(max),
-        "angular: max={max} exceeds the i16 headroom; the kernel would wrap"
-    );
     if census::ALWAYS {
         let simd = cfg!(feature = "simd") && crate::isa() != crate::Isa::Scalar && ok;
         census::bump(
@@ -1091,13 +1091,10 @@ pub fn angular_t(
     max: i32,
 ) {
     let ok = (4..=MAX_N).contains(&n)
+        && (n == 4 || n % 8 == 0)
         && dst.len() >= dst_stride * (n - 1) + n
         && refb.len() >= off + 2 * n + 9
         && angular_i16_is_exact(max);
-    debug_assert!(
-        !(4..=MAX_N).contains(&n) || angular_i16_is_exact(max),
-        "angular_t: max={max} exceeds the i16 headroom; the kernel would wrap"
-    );
     if census::ALWAYS {
         let simd = cfg!(feature = "simd") && crate::isa() != crate::Isa::Scalar && ok;
         census::bump(
@@ -1114,7 +1111,7 @@ pub fn angular_t(
     if ok {
         // SAFETY: the bounds check above covers every load and store.
         match crate::isa() {
-            crate::Isa::Avx2 => {
+            crate::Isa::Avx2 if n < 16 || n % 16 == 0 => {
                 return unsafe {
                     x86::angular_t_avx2(dst.as_mut_ptr(), dst_stride, n, refb.as_ptr(), off, angle)
                 }
@@ -1224,12 +1221,13 @@ pub fn dc_fill(dst: &mut [u16], dst_stride: usize, n: usize, dc: u16) {
 /// Transpose an `n × n` block of samples.
 pub fn transpose(dst: &mut [u16], dst_stride: usize, src: &[u16], src_stride: usize, n: usize) {
     let ok = (4..=MAX_N).contains(&n)
+        && (n == 4 || n % 8 == 0)
         && dst.len() >= dst_stride * (n - 1) + n
         && src.len() >= src_stride * (n - 1) + n;
-    debug_assert!(ok);
+    let _ = ok;
     #[cfg(all(feature = "simd", target_arch = "x86_64"))]
     if ok {
-        // SAFETY: both blocks bounds-checked above.
+        // SAFETY: both blocks and tiled dimensions checked above.
         return unsafe {
             x86::transpose_sse2(dst.as_mut_ptr(), dst_stride, src.as_ptr(), src_stride, n)
         };
