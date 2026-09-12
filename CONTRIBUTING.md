@@ -10,9 +10,11 @@ A small generated video that shows the problem is useful. Public links are fine 
 
 ## Work on a fix
 
-Reproduce the problem before changing the code. For decoding or seeking bugs, compare timestamps and frames with the original behavior. Add a regression test when it protects playback correctness, resource limits, cancellation, or data integrity.
+Reproduce the problem before changing the code. For decoding or seeking bugs, compare timestamps and frames with the original behavior.
 
-Use generated fixtures for automated tests. Keep live YouTube and FixupX requests out of CI; availability and rate limits can change without a code change. Check those providers separately when your patch touches them.
+Keep permanent tests for security, rate limits, cancellation, resource bounds, and data integrity. Remove one-time playback checks, benchmark loops, consumer apps, and their unused fixtures after recording the results. Do not add those checks to CI. A new permanent test should identify the boundary or integrity failure it protects.
+
+Use generated fixtures for automated tests. Keep live provider requests out of CI; availability and rate limits can change without a code change. Check those providers separately when your patch touches them.
 
 ## Checks
 

@@ -1,14 +1,16 @@
 # YouTube support and limits
 
-Rust Media opens public YouTube videos that provide H.264 video and AAC audio. Playback usually starts while media loads into RAM. The fallback loads the whole clip first. Both paths have a 20-minute duration limit and a 128 MiB combined-media limit.
+Rust Media opens public YouTube videos that provide H.264 video and AAC audio. Direct playback starts while media loads. Videos up to 20 minutes use a shared RAM cache; longer videos use range reads without full-video prefetching. The SABR fallback loads the whole clip first and retains its 20-minute and 128 MiB combined-media limits.
 
 The resolver uses an anonymous VisionOS client profile. It needs no account sign-in, but changes to YouTube can break resolution. This is not an official YouTube embedding SDK.
+
+Watch and embed timestamps now reach the player, and `/clip/` links retain their segment boundaries. Longer direct videos use range reads without full-video prefetching. See [current link playback checks](link-playback.md), including the remaining deep-audio-seek delay.
 
 ## How playback works
 
 1. Read the public watch page, retain its anonymous cookies in memory, and extract visitor data and the initial player response.
 2. Request VisionOS player metadata using the same anonymous session.
-3. Select direct H.264 up to 720p30 and AAC. Open both with bounded, allowlisted 512 KiB range requests and begin background prefetching.
+3. Select direct H.264 up to 720p30 and AAC. Open both with bounded, allowlisted 512 KiB range requests. Videos up to 20 minutes use background prefetching; longer videos retain one range block per reader.
 4. Read the MP4 segment index, parse each H.264 fragment when playback reaches it, and let the shared cache fill in the background. Decode fragmented AAC with Symphonia. No full-file scan or remux is needed on this path.
 5. If the direct client request is unavailable, use the existing SABR protobuf path. Rust SWC preprocessing and Boa handle its URL transformation. The SABR parser reassembles bounded UMP parts, carries contexts and validates redirects.
 6. Render native frames and play Rodio audio. Video follows the audio clock. Seek and replay use cached blocks or fetch the missing ranges.
@@ -44,10 +46,11 @@ Automated controls checks exercised the active audio output pipeline at zero vol
 
 ## Loading and cancellation
 
-- `BaW_jenozKc` was unavailable in its public player response. It is not counted as a playback success.
-Direct media loads in ranges. The cache tracks gaps so the buffered bar only counts bytes available from the start of the file. Missing fragments load when needed. Interrupted blocks get two retries; HTTP 4xx responses stop the request.
+`BaW_jenozKc` was unavailable in its public player response. It is not counted as a playback success.
 
-SABR loading allows at most 8 MiB per part or segment, 256 requests, and 180 seconds. It assembles the full clip before playback. Container metadata, decoded frames, and the JavaScript interpreter use memory in addition to the media cache.
+Direct media loads in ranges. Videos up to 20 minutes use a shared cache capped at 128 MiB of combined media. That cache tracks gaps so the buffered bar only counts bytes available from the start of the file. Longer videos retain one range block per reader, with a 2 GiB cap per file and a seven-day declared-duration bound. Their buffered-progress value does not measure downloaded coverage. Missing fragments load when needed. Interrupted blocks get two retries; HTTP 4xx responses stop the request.
+
+SABR loading allows at most 20 minutes, 128 MiB of combined media, 8 MiB per part or segment, 256 requests, and 180 seconds. It assembles the full clip before playback. Container metadata, decoded frames, and the JavaScript interpreter use memory in addition to the media cache.
 
 Only one script worker runs at a time. Cancelling a load lets playback move on, although native parsing already in progress may finish before that worker stops. Replacing a cancelled YouTube load with a local file took 0.020 seconds in the recorded check.
 

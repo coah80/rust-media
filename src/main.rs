@@ -1,3 +1,4 @@
+use rodio::Source;
 use rust_media::{
     audio::Audio,
     decode::MediaVideo,
@@ -46,10 +47,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut checksum = 0u64;
         let mut first_frame_wall = 0.;
         let mut first_frame_buffered = 0.;
+        let end = resolved
+            .end_time
+            .unwrap_or(decoder.duration())
+            .min(decoder.duration());
+        if resolved.start_time >= end {
+            return Err("The requested start time is outside this video".into());
+        }
+        decoder.seek(resolved.start_time)?;
+        let mut first_pts = None;
         while full || count < 60 {
             let Some((pts, frame)) = decoder.frame()? else {
                 break;
             };
+            if pts < resolved.start_time {
+                continue;
+            }
+            if pts >= end {
+                break;
+            }
             if pts < last {
                 return Err("Frame timestamps are out of order".into());
             }
@@ -58,6 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 first_frame_buffered = buffered();
             }
             last = pts;
+            first_pts.get_or_insert(pts);
             first.get_or_insert((frame.width, frame.height));
             checksum = frame.rgba.iter().fold(checksum, |hash, value| {
                 hash.wrapping_mul(31).wrapping_add(u64::from(*value))
@@ -69,8 +86,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let audio_samples = if full && (decoder.has_audio() || audio_source.is_some()) {
             let mut audio = Audio::new(audio_source.unwrap_or(source))?;
-            let samples = audio.by_ref().count();
-            if let Some(error) = audio.error.lock().unwrap().as_ref() {
+            let error = audio.error.clone();
+            audio.try_seek(Duration::from_secs_f64(resolved.start_time))?;
+            let samples = audio
+                .take_duration(Duration::from_secs_f64(end - resolved.start_time))
+                .count();
+            if let Some(error) = error.lock().unwrap().as_ref() {
                 return Err(error.clone().into());
             }
             samples
@@ -78,7 +99,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             0
         };
         println!(
-            "provider={} progressive={} frames={} audio_samples={} dimensions={:?} duration={:.3}s last_pts={:.3}s first_frame_wall={:.3}s first_frame_buffered={:.3} buffered={:.3} decode_wall={:.3}s checksum={checksum:016x}",
+            "provider={} progressive={} frames={} audio_samples={} dimensions={:?} duration={:.3}s last_pts={:.3}s first_frame_wall={:.3}s first_frame_buffered={:.3} buffered={:.3} decode_wall={:.3}s first_pts={:.3}s requested_start={:.3}s range_end={:.3}s checksum={checksum:016x}",
             resolved.provider,
             resolved.progressive,
             count,
@@ -89,7 +110,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             first_frame_wall,
             first_frame_buffered,
             buffered(),
-            start.elapsed().as_secs_f64()
+            start.elapsed().as_secs_f64(),
+            first_pts.unwrap(),
+            resolved.start_time,
+            end
         );
         return Ok(());
     }

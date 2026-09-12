@@ -54,6 +54,11 @@ impl BufferProgress {
     }
 }
 
+pub(crate) fn streamable_cdn(host: &str) -> bool {
+    host.strip_suffix(".streamable.com")
+        .is_some_and(|label| label.starts_with("cdn-") && !label.contains('.'))
+}
+
 pub fn allowed(value: &str) -> bool {
     reqwest::Url::parse(value).is_ok_and(|url| {
         url.scheme() == "https"
@@ -64,6 +69,14 @@ pub fn allowed(value: &str) -> bool {
                 matches!(
                     host,
                     "video.twimg.com"
+                        | "i.imgur.com"
+                        | "media.giphy.com"
+                        | "i.giphy.com"
+                        | "media0.giphy.com"
+                        | "media1.giphy.com"
+                        | "media2.giphy.com"
+                        | "media3.giphy.com"
+                        | "media4.giphy.com"
                         | "cdn.discordapp.com"
                         | "media.discordapp.net"
                         | "images-ext-1.discordapp.net"
@@ -72,6 +85,7 @@ pub fn allowed(value: &str) -> bool {
                         | "download.blender.org"
                         | "media.w3.org"
                 ) || host.ends_with(".googlevideo.com")
+                    || streamable_cdn(host)
             })
     })
 }
