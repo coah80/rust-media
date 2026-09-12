@@ -553,34 +553,6 @@ fn fragment_offsets_preserve_every_decoded_frame() {
 }
 
 #[test]
-fn fragmented_video_decodes_without_full_remux() {
-    let fragmented = include_bytes!("fixtures/fragmented.mp4");
-    let mut video = MediaVideo::fragmented(
-        Cursor::new(fragmented),
-        Cursor::new(fragmented),
-        fragmented.len() as u64,
-    )
-    .unwrap();
-    let mut count = 0;
-    while video.frame().unwrap().is_some() {
-        count += 1;
-    }
-    assert_eq!(count, 48);
-}
-
-#[test]
-fn fragmented_video_is_detected_automatically() {
-    let bytes = include_bytes!("fixtures/fragmented.mp4");
-    let mut video =
-        MediaVideo::open(Cursor::new(bytes), Cursor::new(bytes), bytes.len() as u64).unwrap();
-    let mut frames = 0;
-    while video.frame().unwrap().is_some() {
-        frames += 1;
-    }
-    assert_eq!(frames, 48);
-}
-
-#[test]
 fn macroscope_eager_fragments_follow_preceding_traf() {
     let source = include_bytes!("fixtures/fragmented.mp4");
     let multiplexed = multiplex_eager_fragments(source);

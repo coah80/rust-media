@@ -17,6 +17,8 @@ Ubuntu needs `libasound2-dev` and `pkg-config` for the library. The demo additio
 
 Validate UI changes on both `winit-software` and `winit-femtovg`. Offline CI covers synthetic media, decoding integrity, resource limits, cancellation and destination restrictions. Provider availability is checked manually so external rate limits do not make routine CI nondeterministic.
 
+Keep permanent tests for security, rate limits, cancellation, resource bounds, and data integrity. Remove one-time playback checks, benchmark loops, consumer apps, and their unused fixtures after recording the results. Do not add those checks to CI. A new permanent test should identify the boundary or integrity failure it protects.
+
 ## Release scope
 
 Git consumption is supported. `publish = false` prevents accidental registry publication while the pinned Git-only script dependency remains. The registry has ytdlp-ejs 0.1.1, but its source differs from the tested Git revision; it is not a verified drop-in replacement. A crates.io release requires resolving that dependency, verifying the packaged archive and reviewing the public API. Do not remove the guard just to make publishing succeed.
