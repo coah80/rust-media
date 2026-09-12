@@ -297,6 +297,15 @@ fn playback(
     shared: &Shared,
 ) -> Result<(), String> {
     let resolved = providers::resolve_with_cancel(input, cancel.clone())?;
+    playback_resolved(resolved, cancel, generation, shared)
+}
+
+fn playback_resolved(
+    resolved: providers::Resolved,
+    cancel: &Arc<AtomicBool>,
+    generation: u64,
+    shared: &Shared,
+) -> Result<(), String> {
     if cancel.load(Ordering::Relaxed) {
         return Ok(());
     }
@@ -309,7 +318,19 @@ fn playback(
     } else {
         MediaVideo::open(source.duplicate()?, source.duplicate()?, size)?
     };
-    let mut next = video.frame()?;
+    let end = resolved
+        .end_time
+        .unwrap_or(video.duration())
+        .min(video.duration());
+    let origin = if resolved.end_time.is_some() {
+        resolved.start_time
+    } else {
+        0.
+    };
+    if !resolved.start_time.is_finite() || resolved.start_time < 0. || resolved.start_time >= end {
+        return Err("The requested start time is outside this video".into());
+    }
+    let mut next = None;
     let audio = if video.has_audio() || audio_source.is_some() {
         let source = audio_source.unwrap_or(source);
         let mut output = rodio::DeviceSinkBuilder::open_default_sink()
@@ -327,6 +348,7 @@ fn playback(
     let mut time = 0.;
     let mut previous = Instant::now();
     let mut ended = false;
+    let mut initial_seek = Some(resolved.start_time);
     loop {
         if cancel.load(Ordering::Relaxed) {
             return Ok(());
@@ -335,8 +357,15 @@ fn playback(
             let mut controls = shared.controls.lock().unwrap();
             (controls.paused, controls.volume, controls.seek.take())
         };
-        if let Some(seek) = seek {
-            time = seek.clamp(0., video.duration());
+        let mut pixels = None;
+        let requested_seek = seek
+            .map(|seek| seek + origin)
+            .or_else(|| initial_seek.take());
+        if seek.is_some() {
+            initial_seek = None;
+        }
+        if let Some(seek) = requested_seek {
+            time = seek.clamp(origin, end);
             if let Some((_, player, _, _)) = &audio {
                 player.pause();
             }
@@ -360,12 +389,8 @@ fn playback(
             }
             ended = false;
             previous = Instant::now();
-            if let Some((_, pixels)) = next.take() {
-                let mut snapshot = shared.snapshot.lock().unwrap();
-                if snapshot.generation == generation {
-                    snapshot.pixels = Some(pixels);
-                }
-                drop(snapshot);
+            if let Some((_, frame)) = next.take().filter(|(pts, _)| *pts < end) {
+                pixels = Some(frame);
                 next = video.frame()?;
             }
         }
@@ -390,16 +415,21 @@ fn playback(
             time += previous.elapsed().as_secs_f64();
         }
         previous = Instant::now();
-        let mut pixels = None;
-        while next.as_ref().is_some_and(|(pts, _)| *pts <= time + 0.01) {
+        while next
+            .as_ref()
+            .is_some_and(|(pts, _)| *pts < end && *pts <= time + 0.01)
+        {
             if cancel.load(Ordering::Relaxed) {
                 return Ok(());
             }
             pixels = next.take().map(|(_, pixels)| pixels);
             next = video.frame()?;
         }
-        if next.is_none() && time >= video.duration() - 0.05 {
+        if time >= end || (next.is_none() && time >= end - 0.05) {
             ended = true;
+            if let Some((_, player, _, _)) = &audio {
+                player.pause();
+            }
         }
         let mut state = shared.snapshot.lock().unwrap();
         if state.generation != generation {
@@ -408,8 +438,8 @@ fn playback(
         if pixels.is_some() {
             state.pixels = pixels;
         }
-        state.position = time.min(video.duration());
-        state.duration = video.duration();
+        state.position = time.min(end) - origin;
+        state.duration = end - origin;
         state.buffered = match (&progress, &audio_progress) {
             (Some(video), Some(audio)) => video.fraction().min(audio.fraction()),
             (Some(progress), None) | (None, Some(progress)) => progress.fraction(),
@@ -432,6 +462,44 @@ fn playback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clip_frames_and_timeline_are_published_together() {
+        let player = Player::new();
+        let shared = player.shared.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
+        let mut resolved = providers::resolve(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/pattern.mp4"
+        ))
+        .unwrap();
+        resolved.start_time = 0.2;
+        resolved.end_time = Some(0.8);
+        let worker =
+            std::thread::spawn(move || playback_resolved(resolved, &worker_cancel, 0, &shared));
+        let started = Instant::now();
+        let mut saw_frame = false;
+        let mut ended = false;
+        let mut valid = true;
+        while started.elapsed() < Duration::from_secs(5) {
+            let state = player.snapshot();
+            if state.pixels.is_some() {
+                saw_frame = true;
+                valid &= (state.duration - 0.6).abs() < 0.001
+                    && state.position >= 0.
+                    && state.position <= 0.6 + 0.001;
+            }
+            if state.status == Status::Ended {
+                ended = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        cancel.store(true, Ordering::Relaxed);
+        worker.join().unwrap().unwrap();
+        assert!(saw_frame && ended && valid);
+    }
     #[test]
     fn stop_invalidates_pending_playback() {
         let player = Player::new();
