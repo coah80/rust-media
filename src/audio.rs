@@ -26,6 +26,70 @@ impl MediaSource for MediaReader {
 }
 
 pub struct Audio {
+    inner: Box<dyn Source<Item = f32> + Send>,
+    source_error: Arc<Mutex<Option<String>>>,
+    pub error: Arc<Mutex<Option<String>>>,
+}
+
+impl Audio {
+    pub fn new(mut source: MediaReader) -> Result<Self, String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut magic = [0; 4];
+        source
+            .read_exact(&mut magic)
+            .map_err(|_| "Could not read audio header")?;
+        source
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| "Could not seek audio")?;
+        if magic == [0x1a, 0x45, 0xdf, 0xa3] {
+            let audio = crate::modern::Audio::new(source)?;
+            Ok(Self {
+                source_error: audio.error.clone(),
+                error: audio.error.clone(),
+                inner: Box::new(audio),
+            })
+        } else {
+            let audio = Aac::new(source)?;
+            Ok(Self {
+                source_error: audio.error.clone(),
+                error: audio.error.clone(),
+                inner: Box::new(audio),
+            })
+        }
+    }
+}
+impl Iterator for Audio {
+    type Item = f32;
+    fn next(&mut self) -> Option<f32> {
+        let sample = self.inner.next();
+        if sample.is_none() {
+            let error = self.source_error.lock().unwrap().clone();
+            *self.error.lock().unwrap() = error;
+        }
+        sample
+    }
+}
+impl Source for Audio {
+    fn current_span_len(&self) -> Option<usize> {
+        self.inner.current_span_len()
+    }
+    fn channels(&self) -> NonZero<u16> {
+        self.inner.channels()
+    }
+    fn sample_rate(&self) -> NonZero<u32> {
+        self.inner.sample_rate()
+    }
+    fn total_duration(&self) -> Option<Duration> {
+        self.inner.total_duration()
+    }
+    fn try_seek(&mut self, position: Duration) -> Result<(), rodio::source::SeekError> {
+        self.inner.try_seek(position)?;
+        *self.error.lock().unwrap() = None;
+        Ok(())
+    }
+}
+
+struct Aac {
     format: Box<dyn FormatReader>,
     decoder: Box<dyn Decoder>,
     track: u32,
@@ -40,7 +104,7 @@ pub struct Audio {
     format_known: bool,
     pub error: Arc<Mutex<Option<String>>>,
 }
-impl Audio {
+impl Aac {
     pub fn new(source: MediaReader) -> Result<Self, String> {
         let stream = MediaSourceStream::new(Box::new(source), Default::default());
         let mut hint = Hint::new();
@@ -139,7 +203,7 @@ impl Audio {
         Err(Error::LimitError("too many non-audio packets"))
     }
 }
-impl Iterator for Audio {
+impl Iterator for Aac {
     type Item = f32;
     fn next(&mut self) -> Option<f32> {
         if self.position >= self.buffer.len() {
@@ -157,7 +221,7 @@ impl Iterator for Audio {
         Some(sample)
     }
 }
-impl Source for Audio {
+impl Source for Aac {
     fn current_span_len(&self) -> Option<usize> {
         None
     }

@@ -1,4 +1,5 @@
-//! Native H.264/AAC playback with bounded progressive MP4 reads.
+//! Native video playback with progressive H.264 MP4 reads and buffered VP9,
+//! AV1, HEVC, and WebM decoding.
 //!
 //! [`Player`] owns a playback worker and exposes snapshots for a host event loop.
 //! [`Player::snapshot`] consumes the latest available pixel buffer; retain the
@@ -26,6 +27,7 @@ pub mod audio;
 pub mod decode;
 pub mod fragment;
 pub mod http;
+mod modern;
 pub mod player;
 pub mod providers;
 mod request;

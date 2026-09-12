@@ -2,7 +2,7 @@
 
 Video playback for Rust apps. Open a local file or a supported video link, play audio, and get timestamped RGBA frames to draw in your own UI.
 
-Rust Media decodes H.264 in Rust and plays AAC through Rodio and Symphonia. The library runs without a windowing toolkit; an optional Slint player is included for trying it out. It does not require a WebView, FFmpeg installation, or external downloader.
+Rust Media decodes H.264, VP9, AV1, and HEVC in Rust, with AAC, Opus, and Vorbis audio in the supported containers. The library runs without a windowing toolkit; an optional Slint player is included for trying it out. It does not require a WebView, FFmpeg installation, or external downloader.
 
 ![Slint player showing a generated video test pattern](docs/player.png)
 
@@ -12,7 +12,7 @@ Requires Rust 1.92 or newer. Install from Git; the crate is not published on cra
 
 ```toml
 [dependencies]
-rust-media = { git = "https://github.com/coah80/rust-media", rev = "1813793872ca51873f183939af2ac72b80b9c1b8" }
+rust-media = { git = "https://github.com/coah80/rust-media", branch = "main" }
 ```
 
 `Player` runs playback on a worker thread. Create one and keep it alive for as long as you need playback.
@@ -51,25 +51,25 @@ Windows builds need the MSVC toolchain. macOS needs Xcode command-line tools. Li
 
 | Source | Support |
 | --- | --- |
-| Local files | H.264 MP4/MOV, including fragmented MP4, with optional AAC audio |
-| Direct media URLs | HTTPS MP4/MOV from arbitrary public domains on port 443, including links without file extensions |
+| Local files | H.264 MP4/MOV with AAC; VP9, AV1, or HEVC in ordinary MP4 with AAC; VP9 or AV1 WebM with Opus or Vorbis |
+| Direct media URLs | The same formats over HTTPS from arbitrary public domains on port 443, including links without file extensions |
 | FixupX / FxTwitter | First video in a public post |
 | Streamable | Public share and embed links with an available MP4 stream; see [integration details](docs/streamable.md) |
 | YouTube | Public recorded H.264/AAC videos, timestamp links, and `/clip/` links with their start and end boundaries |
 | Imgur | Individual video links, `.gifv`, and `.mp4`; albums and galleries are unsupported |
 | GIPHY | `/gifs/` and `/embed/` links through their MP4 rendition; no transparency or automatic looping |
 
-Video decoding uses the CPU. Input dimensions are limited to 1920 pixels on either side, and output frames fit within 1280 × 720. Local and ordinary direct files are limited to 2 GiB. Individual compressed samples are limited to 8 MiB.
+Video decoding uses the CPU. Input dimensions are limited to 1920 pixels on either side, and output frames fit within 1280 × 720. H.264 files are limited to 2 GiB. The newer codecs use a separate path capped at 32 MiB per file, loaded into RAM before playback. Individual compressed samples are limited to 8 MiB. See [codec support and checks](docs/codecs.md) for details.
 
 Direct links must point to media, not a webpage containing a player. Media requests reject credentials, private/reserved IP addresses, and DNS answers containing non-public addresses. Redirects get the same checks. Media connections use a validating DNS resolver and ignore environment proxy settings so a proxy cannot bypass those checks. Existing provider adapters still validate their own metadata URLs before opening media.
 
-WebM, VP9, AV1, HEVC, HLS, DRM, subtitles, live streams, hardware decoding, and adaptive quality switching are not supported. Color conversion uses limited-range BT.601; there is no HDR or color-management pipeline. MP4 files with multiple edit segments or multiple runs per track fragment are rejected.
+VP8, HLS, DRM, subtitles, live streams, hardware decoding, and adaptive quality switching are not supported. Fragmented MP4 remains H.264-only. Color conversion uses limited-range BT.601; there is no HDR or color-management pipeline, including for 10-bit video. MP4 files with multiple edit segments or multiple runs per track fragment are rejected.
 
 YouTube resolution uses a Rust JavaScript interpreter, Boa, and a Rust SWC preprocessor. It uses no account credentials or browser session. Provider changes can break link resolution; see [YouTube behavior and limits](docs/youtube.md).
 
 ## Streaming and memory
 
-Normal remote playback starts after metadata and initial media blocks arrive. Reads use 512 KiB HTTP ranges. No video file is saved to disk.
+H.264 remote playback starts after metadata and initial media blocks arrive. Reads use 512 KiB HTTP ranges. No video file is saved to disk. VP9, AV1, HEVC, and WebM currently load the complete compressed file into RAM first, within the 32 MiB cap. Their new decoding path does not yet offer progressive playback. AV1's pure Rust decoder is CPU-heavy and may not keep up with real time.
 
 YouTube videos up to 20 minutes prefetch into a shared RAM cache while playing, within a 128 MiB combined-media limit. Longer videos use ordinary range reads with one block per reader and a 2 GiB limit per media file. Other direct media uses those same range reads. If a server ignores range requests, the file must fit within 32 MiB. YouTube's SABR fallback still requires the complete clip in RAM before playback and retains its 20-minute and 128 MiB limits.
 
@@ -87,7 +87,7 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo run --release --locked --features native -- --probe-all tests/fixtures/pattern.mp4
 ```
 
-`--probe` decodes up to 60 video frames. `--probe-all` decodes all video frames and AAC samples. Both run without a window or audible playback. Listening quality, perceptual audio/video sync, and sustained bandwidth starvation still need testing.
+`--probe` decodes up to 60 video frames. `--probe-all` decodes all video frames and supported audio samples. Both run without a window or audible playback. Listening quality, perceptual audio/video sync, and sustained bandwidth starvation still need testing.
 
 See [contributing](CONTRIBUTING.md) for the full check list and bug-report guidance.
 

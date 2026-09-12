@@ -1,0 +1,20 @@
+[package]
+name = "rusty_h265"
+version = "0.6.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/Remade-With-Rust/rusty_h265"
+autobins = false
+autotests = false
+autoexamples = false
+
+[features]
+default = ["simd"]
+simd = ["rusty_h265-accel/simd"]
+census = ["rusty_h265-accel/census"]
+prof = []
+cabac-trace = []
+
+[dependencies]
+rusty_h265-accel = { path = "../rusty_h265-accel", default-features = false }

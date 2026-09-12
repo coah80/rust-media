@@ -749,10 +749,23 @@ fn indexed_seek_segment(segments: &[FragmentSegment], target: f64) -> usize {
 pub enum MediaVideo<R> {
     Standard(Box<Video<R>>),
     Fragmented(Box<FragmentVideo<R>>),
+    Modern(Box<crate::modern::Video>),
 }
 
 impl<R: Read + Seek> MediaVideo<R> {
     pub fn open(mut reader: R, header_reader: R, size: u64) -> Result<Self, String> {
+        let mut magic = [0; 4];
+        reader
+            .read_exact(&mut magic)
+            .map_err(|_| "Could not read video header")?;
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(|_| "Could not seek video")?;
+        if magic == [0x1a, 0x45, 0xdf, 0xa3] {
+            return crate::modern::Video::new(reader, size)
+                .map(Box::new)
+                .map(Self::Modern);
+        }
         let fragmented = is_fragmented(&mut reader, size)?;
         reader
             .seek(SeekFrom::Start(0))
@@ -760,7 +773,14 @@ impl<R: Read + Seek> MediaVideo<R> {
         if fragmented {
             Self::fragmented(reader, header_reader, size)
         } else {
-            Self::standard(reader, size)
+            match Self::standard(reader, size) {
+                Err(e) if e == "This video codec is not supported yet" => {
+                    crate::modern::Video::new(header_reader, size)
+                        .map(Box::new)
+                        .map(Self::Modern)
+                }
+                result => result,
+            }
         }
     }
 
@@ -778,6 +798,7 @@ impl<R: Read + Seek> MediaVideo<R> {
         match self {
             Self::Standard(video) => video.duration,
             Self::Fragmented(video) => video.duration,
+            Self::Modern(video) => video.duration,
         }
     }
 
@@ -785,6 +806,7 @@ impl<R: Read + Seek> MediaVideo<R> {
         match self {
             Self::Standard(video) => video.audio,
             Self::Fragmented(video) => video.audio,
+            Self::Modern(video) => video.audio,
         }
     }
 
@@ -792,6 +814,7 @@ impl<R: Read + Seek> MediaVideo<R> {
         match self {
             Self::Standard(video) => video.seek(seconds),
             Self::Fragmented(video) => video.seek(seconds),
+            Self::Modern(video) => video.seek(seconds),
         }
     }
 
@@ -799,6 +822,7 @@ impl<R: Read + Seek> MediaVideo<R> {
         match self {
             Self::Standard(video) => video.frame(),
             Self::Fragmented(video) => video.frame(),
+            Self::Modern(video) => video.frame(),
         }
     }
 }

@@ -1,0 +1,12 @@
+[package]
+name = "rusty_h265-accel"
+version = "0.6.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/Remade-With-Rust/rusty_h265"
+
+[features]
+default = ["simd"]
+simd = []
+census = []

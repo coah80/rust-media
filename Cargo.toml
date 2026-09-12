@@ -4,13 +4,13 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.92"
 publish = false
-description = "Native Rust H.264/AAC playback with progressive MP4 streaming"
+description = "Native Rust video playback with H.264 streaming and buffered VP9, AV1, HEVC, and WebM"
 license = "MIT"
 repository = "https://github.com/coah80/rust-media"
 readme = "README.md"
 keywords = ["video", "media", "mp4", "h264", "playback"]
 categories = ["multimedia::video", "multimedia::audio"]
-include = ["/src/**", "/ui/**", "/examples/**", "/tests/**", "/docs/**", "/build.rs", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE", "/THIRD_PARTY.md", "/CONTRIBUTING.md"]
+include = ["/src/**", "/ui/**", "/examples/**", "/tests/**", "/docs/**", "/vendor/**", "/build.rs", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE", "/THIRD_PARTY.md", "/CONTRIBUTING.md"]
 
 [features]
 default = []
@@ -23,6 +23,16 @@ required-features = ["native"]
 
 [dependencies]
 mp4 = "0.14"
+rff-core = "=0.2.1"
+rff-codec = "=0.2.0"
+rff-format = "=0.2.1"
+matroska-demuxer = "=0.8.1"
+rff-format-mp4 = "=0.2.1"
+rff-codec-vp9 = "=0.2.0"
+rusty_h265 = { path = "vendor/rusty_h265" }
+rusty-opus = "=0.9.1"
+rff-codec-vorbis = { version = "=0.2.0", default-features = false }
+rusty_av1d = { version = "=1.2.0", default-features = false, features = ["bitdepth_8", "bitdepth_16"] }
 rusty_h264-decoder = { version = "=0.16.0", default-features = false, features = ["std"] }
 rusty_h264-common = { version = "=0.16.0", default-features = false, features = ["std"] }
 rodio = { version = "0.22.2", default-features = false, features = ["playback", "mp4"] }
@@ -43,6 +53,16 @@ lucide-slint = { version = "1.43.0", optional = true }
 [profile.dev.package.rusty_h264-decoder]
 opt-level = 3
 [profile.dev.package.rusty_h264-common]
+opt-level = 3
+[profile.dev.package.rusty_h265]
+opt-level = 3
+[profile.dev.package.rusty_h265-accel]
+opt-level = 3
+[profile.dev.package.rusty_vp9]
+opt-level = 3
+[profile.dev.package.rusty_av1d]
+opt-level = 3
+[profile.dev.package.rusty-opus]
 opt-level = 3
 [profile.dev.package.rust-media]
 opt-level = 2
