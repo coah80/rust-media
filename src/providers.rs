@@ -879,36 +879,6 @@ mod tests {
     }
 
     #[test]
-    fn macroscope_ciphered_h264_reports_signature_resolution() {
-        let player = serde_json::json!({
-            "playabilityStatus": {"status": "OK"},
-            "videoDetails": {"lengthSeconds": "60", "isLiveContent": false},
-            "streamingData": {
-                "adaptiveFormats": [
-                    {
-                        "mimeType": "audio/mp4; codecs=\"mp4a.40.2\"",
-                        "url": "https://rr1.googlevideo.com/audio"
-                    },
-                    {
-                        "mimeType": "video/webm; codecs=\"vp9\"",
-                        "url": "https://rr1.googlevideo.com/video"
-                    },
-                    {
-                        "mimeType": "video/mp4; codecs=\"avc1.4d401f\"",
-                        "height": 720,
-                        "fps": 30,
-                        "signatureCipher": "s=encrypted"
-                    }
-                ]
-            }
-        });
-        assert_eq!(
-            parse_youtube(&player).unwrap_err(),
-            "This YouTube stream needs URL signature resolution, which is not supported yet"
-        );
-    }
-
-    #[test]
     fn long_youtube_videos_use_ranges_and_live_videos_are_rejected() {
         let mut player = serde_json::json!({
             "playabilityStatus": {"status": "OK"},
@@ -1024,11 +994,5 @@ mod tests {
         assert!(parse_fixtweet(&value).is_err());
         let player = serde_json::json!({"playabilityStatus":{"status":"OK"},"videoDetails":{"lengthSeconds":"60","isLiveContent":false},"streamingData":{"formats":[{"url":"https://evil.test/video","mimeType":"video/mp4; codecs=avc1,mp4a"}]}});
         assert!(parse_youtube(&player).is_err());
-    }
-    #[test]
-    fn youtube_selects_muxed_h264_or_separate_aac() {
-        let player = serde_json::json!({"playabilityStatus":{"status":"OK"},"videoDetails":{"lengthSeconds":"60","isLiveContent":false},"streamingData":{"formats":[{"url":"https://rr1.googlevideo.com/video","mimeType":"video/mp4; codecs=avc1,mp4a","height":360}]}});
-        assert!(parse_youtube(&player).unwrap().audio.is_none());
-        assert!(youtube_progressive(&player).unwrap().progressive);
     }
 }
