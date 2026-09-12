@@ -12,7 +12,7 @@ Twelve fresh-process YouTube startup probes covered the same four videos three t
 
 Two public FixupX videos completed through video and audio with 464 and 908 frames. Their repeated 60-frame probes kept the same checksums. A clean external consumer built the default library without Slint and ran the real zero-volume `Player` pipeline to completion for a 192-frame local file and the 464-frame FixupX video.
 
-A forced SABR fallback decoded all 284 frames and 1,681,408 AAC samples from `jNQXAC9IVRw`, reaching 18.933 seconds with checksum `da6ae811065c373b`. It used the same continuation parser as normal playback. The temporary switch that forced the fallback was removed afterward.
+A forced SABR fallback decoded all 284 frames and 1,681,408 AAC samples from `jNQXAC9IVRw`, reaching 18.933 seconds with checksum `da6ae811065c373b`. It used the continuation parser shared with the SABR fallback. Normal playback uses direct media URLs from `youtube_visionos` and does not run this parser. The temporary switch that forced the fallback was removed afterward.
 
 ## Problems found and fixes
 
