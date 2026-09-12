@@ -1,10 +1,12 @@
 # YouTube support and limits
 
-The provider adapter plays supported public YouTube clips through signed H.264/AAC media and retains SABR as a fallback. Provider behavior can change. The current adapter uses an anonymous VisionOS client profile; it is not an official YouTube embedding SDK.
+Rust Media opens public YouTube videos that provide H.264 video and AAC audio. Direct playback starts while media loads. Videos up to 20 minutes use a shared RAM cache; longer videos use range reads without full-video prefetching. The SABR fallback loads the whole clip first and retains its 20-minute and 128 MiB combined-media limits.
+
+The resolver uses an anonymous VisionOS client profile. It needs no account sign-in, but changes to YouTube can break resolution. This is not an official YouTube embedding SDK.
 
 Watch and embed timestamps now reach the player, and `/clip/` links retain their segment boundaries. Longer direct videos use range reads without full-video prefetching. See [current link playback checks](link-playback.md), including the remaining deep-audio-seek delay.
 
-## Implemented path
+## How playback works
 
 1. Read the public watch page, retain its anonymous cookies in memory, and extract visitor data and the initial player response.
 2. Request VisionOS player metadata using the same anonymous session.
@@ -13,9 +15,9 @@ Watch and embed timestamps now reach the player, and `/clip/` links retain their
 5. If the direct client request is unavailable, use the existing SABR protobuf path. Rust SWC preprocessing and Boa handle its URL transformation. The SABR parser reassembles bounded UMP parts, carries contexts and validates redirects.
 6. Render native frames and play Rodio audio. Video follows the audio clock. Seek and replay use cached blocks or fetch the missing ranges.
 
-## Earlier Windows validation
+## Earlier Windows tests
 
-For the latest memory and integrity results, see [the benchmark report](benchmark-2026-09-11.md). The timings below describe earlier builds.
+These results come from earlier Windows builds. See [the benchmark report](benchmark-2026-09-11.md) for the later memory and decoding checks.
 
 - `jNQXAC9IVRw`: complete 18.933-second video at 320x240, with 19.064 seconds of AAC. A full live URL check decoded all 284 ordered frames. The final release probe loaded the clip and decoded its first 60 frames in 4.416 seconds. Both Slint renderers passed pause across frames, paused seek, resume, mute, fullscreen, Escape, resize, EOF, replay and replacement with a local file.
 - `Gf-fCJ6TkRU`: the progressive direct-client path reached its first 720p frame in 1.166 seconds with 14.7% buffered. It decoded all 4,159 frames and 15,290,368 audio samples without a full-file scan or remux. The final video timestamp and declared duration were both 173.292 seconds. The full release probe completed in 43.483 seconds on the development machine.
@@ -42,12 +44,19 @@ These timings include public page resolution, player metadata, initial media ran
 
 Automated controls checks exercised the active audio output pipeline at zero volume. Listening quality and perceptual lip sync have not been independently assessed. A macOS arm64 progressive release build loaded `Gf-fCJ6TkRU` in the native window and displayed its media title. Updated macOS controls and Linux execution remain unverified.
 
-## Remaining constraints
+## Loading and cancellation
 
-- `BaW_jenozKc` was unavailable in its public player response. It is not counted as a playback success.
-- Direct media starts before complete download. Videos up to 20 minutes use a shared cache capped at 128 MiB of combined media. Longer videos use range reads with a 2 GiB cap per file and a seven-day declared-duration bound. Indexed MP4 fragments load on demand, and interrupted direct-media blocks get two bounded retries. HTTP 4xx responses are not retried. SABR retains its limits of 20 minutes, 128 MiB combined media, 8 MiB per part/segment, 256 requests, and a 180-second loading deadline. SABR fallback clips still load completely before playback. Peak memory also includes container metadata, decoded frames and Boa.
-- One script worker runs at a time. Cancellation releases playback's wait; bounded native parsing may finish before the old worker observes cancellation. Replacing a cancelled YouTube load with a local file took 0.020 seconds in the final cancellation check. Boa execution yields for cancellation checks and has loop, recursion and execution-time limits. Scripts have no host filesystem, process or network APIs. This is not an OS sandbox or a hard allocator limit.
-- No account sign-in, proof-of-origin generation, DRM, live streams or adaptive quality switching is implemented. The direct client profile and hardcoded version can change upstream. No partial clip is silently substituted.
+`BaW_jenozKc` was unavailable in its public player response. It is not counted as a playback success.
+
+Direct media loads in ranges. Videos up to 20 minutes use a shared cache capped at 128 MiB of combined media. That cache tracks gaps so the buffered bar only counts bytes available from the start of the file. Longer videos retain one range block per reader, with a 2 GiB cap per file and a seven-day declared-duration bound. Their buffered-progress value does not measure downloaded coverage. Missing fragments load when needed. Interrupted blocks get two retries; HTTP 4xx responses stop the request.
+
+SABR loading allows at most 20 minutes, 128 MiB of combined media, 8 MiB per part or segment, 256 requests, and 180 seconds. It assembles the full clip before playback. Container metadata, decoded frames, and the JavaScript interpreter use memory in addition to the media cache.
+
+Only one script worker runs at a time. Cancelling a load lets playback move on, although native parsing already in progress may finish before that worker stops. Replacing a cancelled YouTube load with a local file took 0.020 seconds in the recorded check.
+
+Boa checks cancellation during execution and limits loops, recursion, and execution time. Scripts have no filesystem, process, or network APIs. These checks do not provide an OS sandbox or a hard memory cap.
+
+Account sign-in, proof-of-origin generation, DRM, live streams, and adaptive quality switching are not implemented. Failed loads return an error instead of substituting a partial clip.
 
 ## References
 
@@ -57,5 +66,3 @@ Automated controls checks exercised the active audio output pipeline at zero vol
 - [Rust script preprocessing](https://github.com/ahaoboy/ytdlp-ejs), pinned to `03399fa26ee36c823b9fb4fc0125381e9e968733`. Only its Rust preprocessing API is called; no downloader CLI or external-runtime feature is enabled.
 - [Boa](https://github.com/boa-dev/boa), the Rust JavaScript interpreter.
 - [RustyPipe Botguard](https://codeberg.org/ThetaDev/rustypipe-botguard), inspected for its Deno/V8 dependency, not integrated.
-
-Provider behavior can change. These results describe the tested videos and machine, not guaranteed access to other videos or future responses.

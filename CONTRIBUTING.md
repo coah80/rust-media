@@ -1,8 +1,28 @@
 # Contributing
 
-Rust Media is pre-1.0. Keep changes focused and include a reproducer for playback bugs. Report OS, Rust version, enabled features, container/codec and sanitized errors. Do not attach credentials, signed media URLs or private recordings. Use generated fixtures for regression tests.
+Bug fixes, playback improvements, and clearer docs are welcome. Keep each pull request focused on one change and explain how you tested it. The API is still pre-1.0, so call out any changes that would affect apps using the library.
+
+## Report a bug
+
+Include the steps to reproduce it, what you expected, and what happened. Tell us your OS, Rust version, enabled Cargo features, and the video's container and codecs if you know them.
+
+A small generated video that shows the problem is useful. Public links are fine for provider issues, but remove credentials and signed media URLs from logs. Do not upload private recordings.
+
+## Work on a fix
+
+Reproduce the problem before changing the code. For decoding or seeking bugs, compare timestamps and frames with the original behavior.
+
+Keep permanent tests for security, rate limits, cancellation, resource bounds, and data integrity. Remove one-time playback checks, benchmark loops, consumer apps, and their unused fixtures after recording the results. Do not add those checks to CI. A new permanent test should identify the boundary or integrity failure it protects.
+
+Use generated fixtures for automated tests. Keep live provider requests out of CI; availability and rate limits can change without a code change. Check those providers separately when your patch touches them.
 
 ## Checks
+
+Requires Rust 1.92 or newer. Windows needs MSVC; macOS needs Xcode command-line tools.
+
+Ubuntu needs `libasound2-dev` and `pkg-config` for the library. The demo also needs `libfontconfig1-dev`, `libxkbcommon-dev`, `libwayland-dev`, `libx11-dev`, `libx11-xcb-dev`, `libxcb-shape0-dev`, `libxcb-xfixes0-dev`, `libegl1-mesa-dev`, and `libgl1-mesa-dev`.
+
+Run these from the repository root:
 
 ```sh
 cargo fmt --all -- --check
@@ -13,14 +33,16 @@ cargo doc --locked --no-deps
 cargo run --release --locked --features native -- --probe-all tests/fixtures/pattern.mp4
 ```
 
-Ubuntu needs `libasound2-dev` and `pkg-config` for the library. The demo additionally needs `libfontconfig1-dev`, `libxkbcommon-dev`, `libwayland-dev`, `libx11-dev`, `libx11-xcb-dev`, `libxcb-shape0-dev`, `libxcb-xfixes0-dev`, `libegl1-mesa-dev` and `libgl1-mesa-dev`. Windows needs MSVC; macOS needs Xcode command-line tools.
+For UI changes, try the player with `SLINT_BACKEND` set to `winit-software`, then `winit-femtovg`. Test the controls you changed while video is playing. The probe command above checks decoding without opening a window or playing sound.
 
-Validate UI changes on both `winit-software` and `winit-femtovg`. Offline CI covers synthetic media, decoding integrity, resource limits, cancellation and destination restrictions. Provider availability is checked manually so external rate limits do not make routine CI nondeterministic.
+Include the checks you ran and any failures in your PR. Documentation-only changes need a review of examples and links, not a full playback test run.
 
-Keep permanent tests for security, rate limits, cancellation, resource bounds, and data integrity. Remove one-time playback checks, benchmark loops, consumer apps, and their unused fixtures after recording the results. Do not add those checks to CI. A new permanent test should identify the boundary or integrity failure it protects.
+## Adding support
 
-## Release scope
+If you add a format, provider, or platform, document what works and test it through the player. Check long playback, seeking while buffering, slow or disconnected networks, audio device changes, and audio/video sync where relevant. Record the device, build, and results so someone else can repeat the test.
 
-Git consumption is supported. `publish = false` prevents accidental registry publication while the pinned Git-only script dependency remains. The registry has ytdlp-ejs 0.1.1, but its source differs from the tested Git revision; it is not a verified drop-in replacement. A crates.io release requires resolving that dependency, verifying the packaged archive and reviewing the public API. Do not remove the guard just to make publishing succeed.
+## Publishing
 
-Before expanding production support beyond the documented Windows contract, validate long real-time sessions, slow/disconnected networks, seek during buffering, audio device changes, audio/video sync and playback on the added platform. Record measurements and failures. No benchmark establishes flawless behavior for every input.
+Apps currently install Rust Media from Git. `publish = false` stays in place because the script preprocessor depends on a pinned Git revision of `ytdlp-ejs`. The crates.io version has different source and needs testing before it can replace that dependency.
+
+Before a crates.io release, resolve the Git dependency, check the packaged archive, and review the public API. Removing the publishing guard alone does not complete those steps.
