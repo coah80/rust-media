@@ -1,103 +1,89 @@
 # Rust Media
 
-A production-ready Rust video library for the documented Windows playback contract, with an optional native Slint player. The API is pre-1.0 and may change. It resolves supported video links to media streams, reads MP4 data in byte ranges, decodes H.264 in Rust, plays AAC through Rodio/Symphonia, and gives the UI RGBA frames.
+Video playback for Rust apps. Open a local file or a supported video link, play audio, and get timestamped RGBA frames to draw in your own UI.
 
-There is no WebView, browser engine, mpv, FFmpeg runtime, or Python helper. YouTube URL transformation uses Boa, a JavaScript interpreter written in Rust, with a Rust SWC preprocessor. No Node, Deno, V8 or QuickJS runtime is used. Windowing, graphics, audio output, TLS and other platform services still use their normal native dependencies. This is not a claim that every dependency or operating-system component is written in Rust.
+Rust Media decodes H.264 in Rust and plays AAC through Rodio and Symphonia. The library runs without a windowing toolkit; an optional Slint player is included for trying it out. It does not require a WebView, FFmpeg installation, or external downloader.
 
-![Native player with a generated test pattern](docs/player.png)
+![Slint player showing a generated video test pattern](docs/player.png)
 
-## What works
+## Add it to your app
 
-| Input | Current result |
-| --- | --- |
-| Local H.264 MP4 with optional AAC | Video, audio, pause, seek and replay verified on Windows |
-| Direct MP4 from supported media hosts | Bounded HTTP range reads and native decoding |
-| FixupX / FxTwitter public video posts | Public metadata adapter and native playback verified |
-| YouTube | Progressive native H.264/AAC playback up to 720p, with a real buffered bar and SABR fallback |
-| HTML, JavaScript widgets, arbitrary iframes | Not implemented |
-
-The demo has volume, mute, fullscreen, keyboard controls, a seek bar, and controls that hide during playback. It is a standalone experiment, not a Discord player parity claim or a completed Fastcord integration.
-
-## Production contract
-
-Windows x64 playback is production-ready for supported local files, allowlisted direct MP4 URLs, public FixupX posts and public YouTube videos that resolve to H.264/AAC within the limits below. Supported inputs must fail with an error instead of substituting media or bypassing a limit. Provider availability is outside the library's control, and macOS/Linux remain preview targets until current device playback passes there.
-
-Production-ready here covers bounded loading, deterministic decode and seek output, cancellation, replay, replacement, audio playback, the public `Player` API and both Windows Slint renderers. It does not expand the codec, container, provider or duration contract.
-
-## Run
-
-Requires Rust 1.92 or newer. Windows uses the MSVC toolchain. Linux additionally needs native windowing and ALSA development packages, for example `libasound2-dev`, `libfontconfig1-dev`, `libxkbcommon-dev`, `libwayland-dev`, `libx11-dev`, `libx11-xcb-dev`, `libxcb-shape0-dev`, `libxcb-xfixes0-dev`, `libegl1-mesa-dev` and `libgl1-mesa-dev` on Ubuntu. macOS needs Xcode command-line tools. Linux execution has not been verified.
-
-```sh
-cargo run --locked --features native -- path/to/video.mp4
-cargo run --locked --features native -- https://fixupx.com/user/status/POST_ID
-cargo run --release --locked --features native -- https://www.youtube.com/watch?v=jNQXAC9IVRw
-cargo run --locked --features native -- --probe path/to/video.mp4
-cargo run --release --locked --features native -- --probe-all https://www.youtube.com/watch?v=Gf-fCJ6TkRU
-```
-
-Run without an argument to paste a file path or supported link. Space toggles playback, Left/Right seek five seconds, M mutes, F toggles fullscreen, and Escape exits fullscreen. `--probe` resolves the complete input and decodes up to 60 frames without opening a window or playing audio. `--probe-all` decodes every video frame and AAC sample. Probe error output omits source URLs and response bodies.
-
-Set `SLINT_BACKEND` to `winit-software` or `winit-femtovg` to select a renderer. Release builds use `cargo build --release --locked --features native`.
-
-## Library
-
-The default library build has no Slint dependency. Enable `native` only for the demo. Git installation is supported; registry publication remains disabled while the script preprocessor uses a pinned Git dependency. Pin a reviewed commit with `rev` for reproducible integration.
+Requires Rust 1.92 or newer. Install from Git; the crate is not published on crates.io. The API is pre-1.0.
 
 ```toml
 [dependencies]
-rust-media = { git = "https://github.com/coah80/rust-media", branch = "research/youtube-resolver" }
+rust-media = { git = "https://github.com/coah80/rust-media", rev = "1813793872ca51873f183939af2ac72b80b9c1b8" }
 ```
+
+`Player` runs playback on a worker thread. Create one and keep it alive for as long as you need playback.
 
 ```rust
 use rust_media::Player;
 
 let player = Player::new();
 player.load("clip.mp4".into());
-player.pause(true);
-player.seek(12.0);
 player.set_volume(0.5);
-let snapshot = player.snapshot();
 ```
 
-Keep the player alive and poll `snapshot()` from the application's event loop. Each snapshot takes the newest available RGBA frame and includes `buffered`, the contiguous cached fraction used by the grey seek-bar layer. Older undisplayed frames are replaced. `Player` owns one worker, replacing queued loads with the newest request. Dropping or stopping it requests cancellation; dropping does not synchronously join ongoing network work. Provider metadata, direct-media ranges and SABR requests observe cancellation during both header and body waits. Live YouTube-to-local replacement took 20-40 ms.
+Call `player.snapshot()` from your application's event loop. Each snapshot includes playback status, position, duration, buffered progress, and an optional frame. Upload the frame's `rgba` bytes using its `width` and `height` to display it in your UI.
 
-`providers::resolve` returns stream addresses or prepared in-memory media. Use `MediaReader::resolved` to open either representation. `resolve_with_cancel` accepts a shared cancellation flag. These resolver functions are synchronous and return an error inside a single-thread Tokio runtime instead of blocking its only worker. `decode::MediaVideo` accepts ordinary or fragmented MP4 and emits timestamped frames. `http::RemoteFile` implements `Read + Seek` with 512 KiB blocks; progressive readers share a bounded cache and prefetch in the background. The player coordinates these parts and uses the audio playback clock when audio exists.
+A snapshot takes the newest available frame. Retain your previous image when `pixels` is `None`. Check `Status::Failed` and `snapshot.error` to report playback errors.
 
-## Current limits
+Use `pause(bool)`, `seek(seconds)`, and `set_volume(0.0..=1.0)` for controls. Calling `load()` again replaces the current video. Call `stop()` when an embed closes or leaves your view, or drop the player when you no longer need it.
 
-- H.264 in ordinary MP4/MOV containers, direct fragmented MP4 from YouTube and assembled SABR fragments. WebM, VP9, AV1, HEVC, HLS, DRM, subtitles and live streams are not implemented.
-- Software video decoding, up to 1920 pixels on either input dimension. Output is capped at 1280×720. There is no hardware decoding or HDR/color-management pipeline; conversion currently uses limited-range BT.601.
-- File limit 2 GiB, compressed-sample limit 8 MiB and a 16-frame reorder queue. A server ignoring Range is accepted only for files up to 32 MiB. Ordinary range reads retain one block per reader. MP4 metadata and codec reference frames require additional memory.
-- Simple single-segment MP4 edits are supported. Multiple edit segments are rejected. There is no adaptive bitrate selection. Direct range reads retry an interrupted block twice; HTTP 4xx responses stop immediately. SABR respects bounded server-requested backoff.
-- HTTPS media hosts are explicitly allowed in `http::allowed`; every redirect is checked again. Arbitrary website and local-network URLs are rejected. No account cookies or credentials are used. Anonymous provider cookies remain in memory for one resolver session. Local file paths must be supplied explicitly.
-- FixupX chooses the first video in a post. Other videos in the same post are not exposed in the demo.
-- YouTube opens direct H.264/AAC media through YouTube's VisionOS client profile, starts after its metadata and first blocks arrive, and fills a shared cache while playback runs. Combined direct media is limited to 128 MiB and declared duration to 20 minutes. The SABR fallback still prepares the complete clip before playback. No verification-token generator or browser fallback is included. Provider behavior can change. See [YouTube support and limits](docs/youtube.md).
+For direct access to decoding and networking, see `decode::MediaVideo`, `player::MediaReader`, `http::RemoteFile`, and `providers::resolve`. Generate the API docs with `cargo doc --no-deps --open`.
 
-## Validation
-
-The [Windows stress and memory benchmarks](docs/benchmark-2026-09-11.md) record repeated startup, complete decodes, seek integrity and native control checks. They also document the allocator and long-playback decoder retention fixes found during testing.
+## Try the player
 
 ```sh
-cargo test --locked
-cargo test --locked --all-features
-cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo doc --locked --no-deps
-cargo check --locked --no-default-features --lib
+git clone https://github.com/coah80/rust-media.git
+cd rust-media
+cargo run --release --locked --features native -- path/to/clip.mp4
 ```
 
-The benchmark report covers 53,913 frames across four complete videos, a current 21,313-frame rerun of the longest video, repeated startup, deterministic stress and both Windows renderers. Listening quality, perceptual lip sync, sustained bandwidth starvation and this revision on macOS/Linux remain unverified. Hosted CI is configured for Windows, macOS and Linux builds and synthetic tests; that does not establish device playback quality.
+Pass a YouTube or FixupX URL instead of a file path, or run without an argument to paste one into the window. The player includes seeking, volume, mute, fullscreen, and a buffered-progress bar.
 
-See [contributing](CONTRIBUTING.md) for validation and release requirements. `cargo run --release --locked --example play -- clip.mp4` runs the playback worker with audio while discarding video frames. Generate API docs with `cargo doc --no-deps`.
+Space pauses or resumes. Left and Right seek five seconds. M mutes, F toggles fullscreen, and Escape exits fullscreen.
 
-## References
+Windows builds need the MSVC toolchain. macOS needs Xcode command-line tools. Linux needs ALSA and windowing development packages; see [build dependencies](CONTRIBUTING.md#checks). Windows x64 playback has been tested with both the software and femtovg renderers. Current macOS and Linux playback remains unverified.
 
-- [rusty_h264](https://github.com/remade-with-rust/rusty_h264), the Rust H.264 decoder used here with assembly disabled.
-- [Rodio](https://github.com/RustAudio/rodio) and [Symphonia](https://github.com/pdeljanov/Symphonia), audio playback and Rust AAC decoding.
-- [FxEmbed status API](https://github.com/FxEmbed/FxEmbed/wiki/Status-Fetch-API), the public FixupX metadata contract.
+## Supported media
 
-The next steps are direct-client fallback maintenance, adaptive quality selection, additional Rust codecs, and hardware decoding through native platform APIs. Rendering general web pages would be a separate project.
+| Source | Support |
+| --- | --- |
+| Local files | H.264 MP4/MOV, including fragmented MP4, with optional AAC audio |
+| Direct media URLs | HTTPS MP4 from the [supported media hosts](src/http.rs), including Discord CDN and Twitter video |
+| FixupX / FxTwitter | First video in a public post |
+| YouTube | Public recorded videos that provide H.264/AAC, up to 20 minutes and 128 MiB of combined media |
+
+Video decoding uses the CPU. Input dimensions are limited to 1920 pixels on either side, and output frames fit within 1280 × 720. Local and ordinary direct files are limited to 2 GiB. Individual compressed samples are limited to 8 MiB.
+
+WebM, VP9, AV1, HEVC, HLS, DRM, subtitles, live streams, hardware decoding, and adaptive quality switching are not supported. Color conversion uses limited-range BT.601; there is no HDR or color-management pipeline. MP4 files with multiple edit segments or multiple runs per track fragment are rejected.
+
+YouTube resolution uses a Rust JavaScript interpreter, Boa, and a Rust SWC preprocessor. It uses no account credentials or browser session. Provider changes can break link resolution; see [YouTube behavior and limits](docs/youtube.md).
+
+## Streaming and memory
+
+Normal remote playback starts after metadata and initial media blocks arrive. Reads use 512 KiB HTTP ranges. No video file is saved to disk.
+
+YouTube playback prefetches into a shared RAM cache while the video plays. That cache can grow to the complete clip, within the 128 MiB combined-media limit. Ordinary direct playback retains one range block per reader. If a server ignores range requests, the file must fit within 32 MiB. YouTube's SABR fallback assembles the complete clip in memory before playback starts.
+
+Pausing or reaching the end keeps playback resources available for replay. Stopping, replacing, or dropping the player cancels loading and releases its playback resources after the worker exits that playback session. Cleanup is asynchronous. Any reader or progress handles retained by your app can keep their shared cache alive, and the process allocator may retain freed memory for reuse.
+
+## Tests and measurements
+
+The [Windows benchmark report](docs/benchmark-2026-09-11.md) records startup times, memory usage, complete video decodes, repeated seeks, and player controls. Tests compare presentation timestamps and decoded pixels, and cover cancellation, malformed media, and resource limits.
+
+```sh
+cargo test --locked --all-features
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo run --release --locked --features native -- --probe-all tests/fixtures/pattern.mp4
+```
+
+`--probe` decodes up to 60 video frames. `--probe-all` decodes all video frames and AAC samples. Both run without a window or audible playback. Listening quality, perceptual audio/video sync, and sustained bandwidth starvation still need testing.
+
+See [contributing](CONTRIBUTING.md) for the full check list and bug-report guidance.
 
 ## License
 
-Original project code is [MIT](LICENSE). Dependencies retain their own terms, including optional Slint licensing; see [third-party components](THIRD_PARTY.md). The native demo uses [Slint](https://slint.dev).
+Project code is [MIT](LICENSE). Dependencies have their own licenses, including the optional Slint UI. See [third-party components](THIRD_PARTY.md) for details.
