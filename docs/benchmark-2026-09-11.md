@@ -2,9 +2,9 @@
 
 Release builds on Windows x64, AMD Ryzen 7 9800X3D. Measurements use Windows process memory counters sampled every 100 ms. Working set is resident process memory; private bytes are committed private memory. Neither includes all GPU memory. Live network timings include resolution and initial media reads. Concurrent builds and probes affected some full-decode timings, so they are correctness and memory checks, not controlled throughput comparisons.
 
-## Production-readiness rerun
+## Final test pass
 
-The final review run added 37 focused regressions covering all 32 Macroscope review threads and filtered correctness notes. They cover parser and cache limits, aggregate fragment and index limits, pre-parser initialization and run limits, whole-file fragment sample limits, extended box sizes, track defaults, indexed and eager multiplexed fragment offsets, audio-only fragment skipping, multiple-run rejection, fragment timelines, track-specific and successive indexes, SAP-aware seeking, fragmented audio detection, edit lists, sparse-frame probing, split UMP parts, bounded context policies, reserved framing bytes, cancellation during stalled response headers, bodies, remuxing and retries, duration enforcement, provider error selection and Tokio runtime reentry.
+The review led to 37 regression tests covering 32 Macroscope threads and its additional correctness notes. The tests cover malformed input and allocation limits, fragment offsets and timestamps, index selection, seeking, audio detection, and provider errors. They also check cancellation during stalled requests, retries, and fragment assembly, plus calls made from inside a Tokio runtime.
 
 The full suite passed 71 checks with native features. A separate stress test passed 100 fresh decoder open/seek cycles, 20 repeated complete ordinary decodes and 25 repeated complete fragmented decodes with exact presentation timestamps and RGBA checksums. The release CLI then completed 25 ordinary and 25 automatically detected fragmented local-file decodes with stable frame counts and checksums. This run found and fixed a B-frame seek boundary that the smaller seek test missed.
 
@@ -12,7 +12,7 @@ Twelve fresh-process YouTube startup probes covered the same four videos three t
 
 Two public FixupX videos completed through video and audio with 464 and 908 frames. Their repeated 60-frame probes kept the same checksums. A clean external consumer built the default library without Slint and ran the real zero-volume `Player` pipeline to completion for a 192-frame local file and the 464-frame FixupX video.
 
-A current forced SABR fallback completed `jNQXAC9IVRw` through 284 frames and 1,681,408 AAC samples at 18.933 seconds with checksum `da6ae811065c373b`. The test used the production continuation parser and a temporary fallback selector that was removed afterward. The normal progressive path remained the release default.
+A forced SABR fallback decoded all 284 frames and 1,681,408 AAC samples from `jNQXAC9IVRw`, reaching 18.933 seconds with checksum `da6ae811065c373b`. It used the same continuation parser as normal playback. The temporary switch that forced the fallback was removed afterward.
 
 ## Problems found and fixes
 
@@ -65,6 +65,8 @@ After removing the temporary UI driver, the release executable was rebuilt and a
 
 After switching range responses to direct asynchronous cancellation, a release build retained the established `Gf-fCJ6TkRU` checksum with a 1.358-second first frame and completed a FixupX startup probe in 0.358 seconds.
 
-## Remaining coverage limits
+## What still needs testing
 
-No adaptive quality switching, hardware decoding, arbitrary codecs, DRM or live-stream support was added. Listening quality, perceptual lip sync, extended real-time playback under sustained bandwidth starvation, and this revision on macOS/Linux remain unverified. Direct-media retries still have finite blocking request timeouts. Supported YouTube inputs retain the 20-minute / 128 MiB compressed-media limits. See [support details](youtube.md).
+These probes check decoded output and memory use. They do not establish listening quality or perceptual audio/video sync. Long real-time sessions on a consistently slow connection and playback of this revision on macOS and Linux still need testing.
+
+The results apply to the formats and loading limits in [YouTube support](youtube.md) and the [README](../README.md#supported-media). They do not add codec support, adaptive quality switching, hardware decoding, DRM, or live streams.

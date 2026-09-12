@@ -1,6 +1,6 @@
 # Third-party components
 
-The MIT license covers this repository's original code. Dependencies retain their own licenses. Review their notices when redistributing a build; this overview is not a complete transitive license bundle.
+This project's code uses the MIT license. Its dependencies have their own licenses, listed below for the main components. If you redistribute a build, check the notices for its full dependency tree too.
 
 | Component | Purpose | Declared license |
 | --- | --- | --- |
@@ -15,4 +15,4 @@ The MIT license covers this repository's original code. Dependencies retain thei
 
 Slint's licensing choices and attribution requirements are described in its [license documentation](https://github.com/slint-ui/slint/blob/master/LICENSE.md). This project does not relicense Slint under MIT. The default library build does not enable Slint.
 
-See `Cargo.lock` for exact versions and source revisions. `cargo metadata --locked --format-version 1` exposes dependency license declarations. Synthetic MP4 fixtures were generated for this project; fetched provider media and extracted scripts are not distributed here.
+Check `Cargo.lock` for exact versions and source revisions. Run `cargo metadata --locked --format-version 1` to read dependency license declarations. The MP4 test fixtures were generated for this project. Downloaded provider media and extracted scripts are not included in the repository.
