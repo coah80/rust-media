@@ -2,11 +2,13 @@
 
 The provider adapter plays supported public YouTube clips through signed H.264/AAC media and retains SABR as a fallback. Provider behavior can change. The current adapter uses an anonymous VisionOS client profile; it is not an official YouTube embedding SDK.
 
+Watch and embed timestamps now reach the player, and `/clip/` links retain their segment boundaries. Longer direct videos use range reads without full-video prefetching. See [current link playback checks](link-playback.md), including the remaining deep-audio-seek delay.
+
 ## Implemented path
 
 1. Read the public watch page, retain its anonymous cookies in memory, and extract visitor data and the initial player response.
 2. Request VisionOS player metadata using the same anonymous session.
-3. Select direct H.264 up to 720p30 and AAC. Open both with bounded, allowlisted 512 KiB range requests and begin background prefetching.
+3. Select direct H.264 up to 720p30 and AAC. Open both with bounded, allowlisted 512 KiB range requests. Videos up to 20 minutes use background prefetching; longer videos retain one range block per reader.
 4. Read the MP4 segment index, parse each H.264 fragment when playback reaches it, and let the shared cache fill in the background. Decode fragmented AAC with Symphonia. No full-file scan or remux is needed on this path.
 5. If the direct client request is unavailable, use the existing SABR protobuf path. Rust SWC preprocessing and Boa handle its URL transformation. The SABR parser reassembles bounded UMP parts, carries contexts and validates redirects.
 6. Render native frames and play Rodio audio. Video follows the audio clock. Seek and replay use cached blocks or fetch the missing ranges.
@@ -43,7 +45,7 @@ Automated controls checks exercised the active audio output pipeline at zero vol
 ## Remaining constraints
 
 - `BaW_jenozKc` was unavailable in its public player response. It is not counted as a playback success.
-- Direct media starts before complete download and is retained in a shared gap-aware cache. Indexed MP4 fragments load on demand, and interrupted direct-media blocks get two bounded retries. HTTP 4xx responses are not retried. Limits are 128 MiB of combined direct media, 20 minutes of declared duration, 8 MiB per SABR part/segment, 256 SABR requests and a 180-second SABR loading deadline. SABR fallback clips still load completely before playback. These are resource bounds, not availability promises. Peak memory also includes container metadata, decoded frames and Boa.
+- Direct media starts before complete download. Videos up to 20 minutes use a shared cache capped at 128 MiB of combined media. Longer videos use range reads with a 2 GiB cap per file and a seven-day declared-duration bound. Indexed MP4 fragments load on demand, and interrupted direct-media blocks get two bounded retries. HTTP 4xx responses are not retried. SABR retains its limits of 20 minutes, 128 MiB combined media, 8 MiB per part/segment, 256 requests, and a 180-second loading deadline. SABR fallback clips still load completely before playback. Peak memory also includes container metadata, decoded frames and Boa.
 - One script worker runs at a time. Cancellation releases playback's wait; bounded native parsing may finish before the old worker observes cancellation. Replacing a cancelled YouTube load with a local file took 0.020 seconds in the final cancellation check. Boa execution yields for cancellation checks and has loop, recursion and execution-time limits. Scripts have no host filesystem, process or network APIs. This is not an OS sandbox or a hard allocator limit.
 - No account sign-in, proof-of-origin generation, DRM, live streams or adaptive quality switching is implemented. The direct client profile and hardcoded version can change upstream. No partial clip is silently substituted.
 
