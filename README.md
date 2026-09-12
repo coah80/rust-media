@@ -52,7 +52,7 @@ Windows builds need the MSVC toolchain. macOS needs Xcode command-line tools. Li
 | Source | Support |
 | --- | --- |
 | Local files | H.264 MP4/MOV, including fragmented MP4, with optional AAC audio |
-| Direct media URLs | HTTPS MP4 from the [supported media hosts](src/http.rs), including Discord CDN and Twitter video |
+| Direct media URLs | HTTPS MP4/MOV from arbitrary public domains on port 443, including links without file extensions |
 | FixupX / FxTwitter | First video in a public post |
 | Streamable | Public share and embed links with an available MP4 stream; see [integration details](docs/streamable.md) |
 | YouTube | Public recorded H.264/AAC videos, timestamp links, and `/clip/` links with their start and end boundaries |
@@ -60,6 +60,8 @@ Windows builds need the MSVC toolchain. macOS needs Xcode command-line tools. Li
 | GIPHY | `/gifs/` and `/embed/` links through their MP4 rendition; no transparency or automatic looping |
 
 Video decoding uses the CPU. Input dimensions are limited to 1920 pixels on either side, and output frames fit within 1280 × 720. Local and ordinary direct files are limited to 2 GiB. Individual compressed samples are limited to 8 MiB.
+
+Direct links must point to media, not a webpage containing a player. Media requests reject credentials, private/reserved IP addresses, and DNS answers containing non-public addresses. Redirects get the same checks. Media connections use a validating DNS resolver and ignore environment proxy settings so a proxy cannot bypass those checks. Existing provider adapters still validate their own metadata URLs before opening media.
 
 WebM, VP9, AV1, HEVC, HLS, DRM, subtitles, live streams, hardware decoding, and adaptive quality switching are not supported. Color conversion uses limited-range BT.601; there is no HDR or color-management pipeline. MP4 files with multiple edit segments or multiple runs per track fragment are rejected.
 

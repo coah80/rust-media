@@ -11,6 +11,80 @@ use std::{
 const BLOCK: u64 = 512 * 1024;
 const MAX_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 
+pub fn public_url(value: &str) -> bool {
+    reqwest::Url::parse(value).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.port_or_known_default() == Some(443)
+            && url.host_str().is_some_and(|host| {
+                if let Ok(ip) = host.trim_start_matches('[').trim_end_matches(']').parse() {
+                    public_ip(ip)
+                } else {
+                    let host = host.trim_end_matches('.');
+                    host.contains('.')
+                        && ![
+                            "localhost",
+                            "local",
+                            "internal",
+                            "home",
+                            "lan",
+                            "invalid",
+                            "test",
+                        ]
+                        .iter()
+                        .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
+                }
+            })
+    })
+}
+
+fn public_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            let [a, b, c, _] = ip.octets();
+            !ip.is_private()
+                && !ip.is_loopback()
+                && !ip.is_link_local()
+                && !ip.is_documentation()
+                && a != 0
+                && a < 224
+                && !(a == 100 && (64..=127).contains(&b))
+                && !(a == 192 && b == 0 && c == 0)
+                && !(a == 192 && b == 88 && c == 99)
+                && !(a == 198 && (b == 18 || b == 19))
+        }
+        std::net::IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            segments[0] & 0xe000 == 0x2000
+                && !(segments[0] == 0x2001 && (segments[1] < 0x200 || segments[1] == 0xdb8))
+                && segments[0] != 0x2002
+                && !(segments[0] == 0x3fff && segments[1] < 0x1000)
+        }
+    }
+}
+
+fn public_addresses(addresses: Vec<std::net::SocketAddr>) -> io::Result<reqwest::dns::Addrs> {
+    if addresses.is_empty() || addresses.iter().any(|address| !public_ip(address.ip())) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Video address is not public",
+        ));
+    }
+    Ok(Box::new(addresses.into_iter()))
+}
+
+struct PublicDns;
+
+impl reqwest::dns::Resolve for PublicDns {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            let addresses = tokio::net::lookup_host((name.as_str(), 0)).await?.collect();
+            public_addresses(addresses).map_err(Into::into)
+        })
+    }
+}
+
 #[derive(Default)]
 struct Cache {
     blocks: Mutex<BTreeMap<u64, Arc<[u8]>>>,
@@ -139,10 +213,12 @@ impl RemoteFile {
         cache: Option<Arc<Cache>>,
         max_size: u64,
     ) -> Result<Self, String> {
-        if !allowed(url) {
+        if !public_url(url) {
             return Err("Unsupported video address".into());
         }
         let client = reqwest::Client::builder()
+            .no_proxy()
+            .dns_resolver(Arc::new(PublicDns))
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(8))
             .timeout(Duration::from_secs(15))
@@ -224,7 +300,7 @@ impl RemoteFile {
     ) -> io::Result<(u64, u64, Vec<u8>)> {
         let mut url = initial_url.to_owned();
         for redirect in 0..5 {
-            if (!allow_initial || redirect > 0) && !allowed(&url) {
+            if (!allow_initial || redirect > 0) && !public_url(&url) {
                 return Err(io::ErrorKind::PermissionDenied.into());
             }
             let request = self
@@ -443,6 +519,59 @@ mod tests {
             "https://video.twimg.com:444/a",
         ] {
             assert!(!super::allowed(url));
+        }
+    }
+
+    #[test]
+    fn arbitrary_video_urls_reject_private_and_reserved_targets() {
+        for url in [
+            "https://files.example.org/video.mp4",
+            "https://8.8.8.8/video",
+            "https://[2606:4700:4700::1111]/video",
+        ] {
+            assert!(super::public_url(url), "rejected {url}");
+        }
+        for url in [
+            "http://files.example.org/video.mp4",
+            "https://user:pass@files.example.org/video",
+            "https://files.example.org:8443/video",
+            "https://localhost/video",
+            "https://server.local/video",
+            "https://127.1/video",
+            "https://2130706433/video",
+            "https://10.0.0.1/video",
+            "https://100.64.0.1/video",
+            "https://169.254.169.254/video",
+            "https://192.168.0.1/video",
+            "https://192.0.0.8/video",
+            "https://198.18.0.1/video",
+            "https://224.0.0.1/video",
+            "https://0.0.0.0/video",
+            "https://[::1]/video",
+            "https://[::ffff:127.0.0.1]/video",
+            "https://[fc00::1]/video",
+            "https://[fe80::1]/video",
+            "https://[2001:db8::1]/video",
+            "https://[2002:7f00:1::]/video",
+            "https://[64:ff9b::7f00:1]/video",
+        ] {
+            assert!(!super::public_url(url), "accepted {url}");
+        }
+    }
+
+    #[test]
+    fn dns_answers_must_all_be_public() {
+        let public = "8.8.8.8:443".parse().unwrap();
+        assert!(super::public_addresses(vec![public]).is_ok());
+        assert!(super::public_addresses(vec![]).is_err());
+        for ip in [
+            "127.0.0.1:443",
+            "10.0.0.1:443",
+            "[::1]:443",
+            "[::ffff:10.0.0.1]:443",
+        ] {
+            assert!(super::public_addresses(vec![ip.parse().unwrap()]).is_err());
+            assert!(super::public_addresses(vec![public, ip.parse().unwrap()]).is_err());
         }
     }
 

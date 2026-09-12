@@ -84,7 +84,7 @@ pub fn resolve_with_cancel(input: &str, cancel: Arc<AtomicBool>) -> Result<Resol
         ),
         "imgur.com" | "www.imgur.com" | "i.imgur.com" => imgur(&url),
         "giphy.com" | "www.giphy.com" => giphy(&url),
-        _ if crate::http::allowed(input) => Ok(Resolved {
+        _ if crate::http::public_url(input) => Ok(Resolved {
             start_time: 0.,
             end_time: None,
             video: input.into(),

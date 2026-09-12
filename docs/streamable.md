@@ -6,7 +6,7 @@ The resolver prefers the highest-resolution rendition that fits 1280 × 720, inc
 
 Media uses ordinary HTTP range playback with one 512 KiB block retained per reader. It does not use YouTube's prefetch cache or SABR fallback, and does not write a video file to disk. The current buffered-progress value for this path is not a measurement of how much of the whole clip has downloaded.
 
-Metadata requests have a 4 MiB response limit, a 20-second deadline, and cancellation. Only HTTPS media URLs on single-label `cdn-*.streamable.com` hosts are accepted. Credentials, nonstandard ports, unrelated hosts, and non-MP4 paths are rejected. Metadata redirects are not followed; media redirects must pass the existing host checks.
+Metadata requests have a 4 MiB response limit, a 20-second deadline, and cancellation. Only HTTPS media URLs on single-label `cdn-*.streamable.com` hosts are accepted from Streamable metadata. Credentials, nonstandard ports, unrelated hosts, and non-MP4 paths are rejected there. Metadata redirects are not followed; media redirects must pass the public-address and DNS checks used for all remote video.
 
 Processing, deleted, private, or otherwise unavailable videos may fail. HLS and unsupported codecs remain unsupported. Signed media links expire, so retain the share link and resolve it again for a later playback session.
 
