@@ -415,6 +415,7 @@ fn playback_resolved(
             time += previous.elapsed().as_secs_f64();
         }
         previous = Instant::now();
+        let frame_budget = Instant::now();
         while next
             .as_ref()
             .is_some_and(|(pts, _)| *pts < end && *pts <= time + 0.01)
@@ -422,8 +423,17 @@ fn playback_resolved(
             if cancel.load(Ordering::Relaxed) {
                 return Ok(());
             }
+            {
+                let controls = shared.controls.lock().unwrap();
+                if controls.paused != paused || controls.seek.is_some() {
+                    break;
+                }
+            }
             pixels = next.take().map(|(_, pixels)| pixels);
             next = video.frame()?;
+            if frame_budget.elapsed() >= Duration::from_millis(16) {
+                break;
+            }
         }
         if time >= end || (next.is_none() && time >= end - 0.05) {
             ended = true;
